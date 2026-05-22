@@ -237,12 +237,15 @@ def generate_content(piece_name: str, transcript: str, episode_title: str) -> st
     prompt_fn = PROMPTS.get(piece_name)
     if not prompt_fn:
         raise ValueError(f"Unknown piece: {piece_name}")
+    # Sanitize any non-ASCII characters from transcript and title
+    clean_transcript = transcript.encode("ascii", "ignore").decode("ascii")
+    clean_title = episode_title.encode("ascii", "ignore").decode("ascii")
     log.info(f"  Generating {piece_name}...")
     message = client.messages.create(
         model="claude-opus-4-5",
         max_tokens=1500,
         system=BRAND_SYSTEM,
-        messages=[{"role": "user", "content": prompt_fn(transcript, episode_title)}],
+        messages=[{"role": "user", "content": prompt_fn(clean_transcript, clean_title)}],
     )
     return message.content[0].text.strip()
 
