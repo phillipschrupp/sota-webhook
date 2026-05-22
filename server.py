@@ -164,6 +164,27 @@ CONTENT:
 }
 
 # ── Whisper transcription ─────────────────────────────────────────────────────
+WHISPER_LIMIT = 24 * 1024 * 1024  # 24 MB — stay just under Whisper's 25 MB cap
+
+def compress_audio(input_path: str) -> str:
+    """Compress audio to mono MP3 at 32kbps using ffmpeg. Returns path to compressed file."""
+    import subprocess
+    output_path = input_path + "_compressed.mp3"
+    cmd = [
+        "ffmpeg", "-y", "-i", input_path,
+        "-ac", "1",           # mono
+        "-ar", "16000",       # 16kHz sample rate — plenty for speech
+        "-b:a", "32k",        # 32kbps bitrate — ~14 MB/hr of audio
+        "-map", "0:a",        # audio only
+        output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {result.stderr.decode()[:300]}")
+    size = os.path.getsize(output_path)
+    log.info(f"  Compressed to {size // 1024 // 1024:.1f} MB")
+    return output_path
+
 def transcribe_audio(audio_url: str) -> str:
     log.info(f"  Downloading audio: {audio_url[:80]}...")
     req = Request(audio_url, headers={
@@ -172,7 +193,8 @@ def transcribe_audio(audio_url: str) -> str:
     with urlopen(req, timeout=120) as resp:
         audio_data = resp.read()
 
-    log.info(f"  Downloaded {len(audio_data) // 1024 // 1024:.1f} MB — sending to Whisper...")
+    size_mb = len(audio_data) / 1024 / 1024
+    log.info(f"  Downloaded {size_mb:.1f} MB")
 
     suffix = ".mp3"
     if audio_url.lower().endswith(".m4a"): suffix = ".m4a"
@@ -182,9 +204,19 @@ def transcribe_audio(audio_url: str) -> str:
         tmp.write(audio_data)
         tmp_path = tmp.name
 
+    compressed_path = None
     try:
+        # Compress if over Whisper's limit
+        if len(audio_data) > WHISPER_LIMIT:
+            log.info(f"  File exceeds 24 MB — compressing with ffmpeg...")
+            compressed_path = compress_audio(tmp_path)
+            send_path = compressed_path
+        else:
+            send_path = tmp_path
+
+        log.info(f"  Sending to Whisper...")
         client = openai.OpenAI(api_key=OPENAI_API_KEY)
-        with open(tmp_path, "rb") as audio_file:
+        with open(send_path, "rb") as audio_file:
             result = client.audio.transcriptions.create(
                 model="whisper-1",
                 file=audio_file,
@@ -195,6 +227,8 @@ def transcribe_audio(audio_url: str) -> str:
         return transcript
     finally:
         os.unlink(tmp_path)
+        if compressed_path and os.path.exists(compressed_path):
+            os.unlink(compressed_path)
 
 
 # ── Claude content generation ─────────────────────────────────────────────────
