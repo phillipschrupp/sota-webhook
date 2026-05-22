@@ -2,7 +2,7 @@ services:
   - type: web
     name: sota-content-automation
     runtime: python
-    buildCommand: apt-get install -y ffmpeg && pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt
     startCommand: python server.py
     envVars:
       - key: ANTHROPIC_API_KEY
