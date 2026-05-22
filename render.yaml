@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: sota-content-automation
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false          # you'll paste this in Render's dashboard
+      - key: GOOGLE_SCRIPT_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: PORT
+        value: 8080
+    healthCheckPath: /health
