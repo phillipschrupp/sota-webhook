@@ -249,7 +249,7 @@ def generate_content(piece_name: str, transcript: str, episode_title: str) -> st
 
 # ── Google Doc creation ───────────────────────────────────────────────────────
 def create_google_doc(title: str, content: str, folder: str) -> bool:
-    payload = json.dumps({"title": title, "content": content, "folder": folder}).encode()
+    payload = json.dumps({"title": title, "content": content, "folder": folder}, ensure_ascii=False).encode("utf-8")
     req = Request(GOOGLE_SCRIPT_URL, data=payload,
                   headers={"Content-Type": "application/json"})
     try:
