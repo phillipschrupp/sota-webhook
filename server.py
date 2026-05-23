@@ -267,13 +267,16 @@ def create_google_doc(title: str, content: str, folder: str) -> bool:
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 def run_pipeline(episode_title: str, audio_url: str) -> dict:
-    log.info(f"Pipeline start — '{episode_title}'")
+    # Sanitize all text to ASCII-safe at entry — handles em dashes, curly quotes, etc.
+    episode_title = episode_title.encode("ascii", "ignore").decode("ascii")
+    log.info(f"Pipeline start - '{episode_title}'")
     safe_title  = episode_title[:60].strip()
     folder_name = f"SOTA Podcast — {safe_title}"
     results     = {"episode": episode_title, "docs": [], "errors": []}
 
     try:
         transcript = transcribe_audio(audio_url)
+        transcript = transcript.encode("ascii", "ignore").decode("ascii")
     except Exception as e:
         log.error(f"  Transcription failed: {e}")
         results["errors"].append(f"Transcription: {e}")
