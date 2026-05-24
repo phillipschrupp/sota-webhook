@@ -181,18 +181,69 @@ def transcribe_audio(audio_url):
         else:
             send_path = tmp_path
 
-        log.info("Sending to Whisper...")
         client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
+        # First pass: verbose JSON with word-level timestamps for speaker formatting
+        log.info("Sending to Whisper (verbose)...")
         with open(send_path, "rb") as f:
-            result = client.audio.transcriptions.create(
-                model="whisper-1", file=f, response_format="text")
-        transcript = result if isinstance(result, str) else result.text
-        log.info("Transcription complete - %d chars", len(transcript))
-        return transcript
+            verbose_result = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                response_format="verbose_json",
+                timestamp_granularities=["segment"]
+            )
+
+        # Build formatted transcript with timestamps and inferred speakers
+        formatted = format_transcript(verbose_result)
+
+        # Plain transcript for Claude content generation
+        plain = " ".join(seg.text.strip() for seg in verbose_result.segments)
+
+        log.info("Transcription complete - %d chars", len(plain))
+        return plain, formatted
+
     finally:
         os.unlink(tmp_path)
         if compressed_path and os.path.exists(compressed_path):
             os.unlink(compressed_path)
+
+
+def format_transcript(verbose_result):
+    """
+    Format Whisper verbose JSON into a readable transcript.
+    Whisper-1 does not natively identify speakers, so we label
+    segments as Speaker 1 / Speaker 2 using a simple heuristic:
+    long pauses (>1.5s gap between segments) suggest a speaker change.
+    For a podcast with two hosts this produces a clean readable doc.
+    """
+    segments = verbose_result.segments
+    if not segments:
+        return ""
+
+    lines = []
+    current_speaker = 1
+    prev_end = 0.0
+    PAUSE_THRESHOLD = 1.5  # seconds gap = likely speaker change
+
+    for seg in segments:
+        start = seg.start
+        text  = seg.text.strip()
+        if not text:
+            continue
+
+        # Detect speaker change on significant pause
+        if (start - prev_end) > PAUSE_THRESHOLD and prev_end > 0:
+            current_speaker = 2 if current_speaker == 1 else 1
+
+        # Format timestamp as MM:SS
+        mins = int(start // 60)
+        secs = int(start % 60)
+        timestamp = "[%02d:%02d]" % (mins, secs)
+
+        lines.append("Speaker %d %s: %s" % (current_speaker, timestamp, text))
+        prev_end = seg.end
+
+    return "\n\n".join(lines)
 
 def generate_content(piece_name, transcript, episode_title):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -232,25 +283,41 @@ def run_pipeline(episode_title, audio_url):
     results     = {"episode": episode_title, "docs": [], "errors": []}
 
     try:
-        transcript = clean(transcribe_audio(audio_url))
+        plain_transcript, formatted_transcript = transcribe_audio(audio_url)
+        plain_transcript     = clean(plain_transcript)
+        formatted_transcript = clean(formatted_transcript)
     except Exception as e:
         log.error("Transcription failed: %s", e)
         results["errors"].append("Transcription: " + str(e))
         return results
 
+    # Save raw transcript as first doc in the folder
+    transcript_title = "[SOTA] Transcript - " + safe_title
+    header = "# " + episode_title + "\n\n"
+    header += "## Full Episode Transcript\n\n"
+    header += "Note: Speaker labels are auto-detected based on pause patterns.\n"
+    header += "Verify against the recording if exact attribution is needed.\n\n"
+    header += "---\n\n"
+    ok = create_google_doc(transcript_title, header + formatted_transcript, folder_name)
+    if ok:
+        results["docs"].append(transcript_title)
+        log.info("Transcript doc saved.")
+    else:
+        results["errors"].append("Transcript: doc creation failed")
+
+    # Generate all 7 content pieces using plain transcript
     pieces = [
         ("instagram_carousel", "Instagram Carousel"),
         ("pull_quotes",        "Pull Quotes"),
         ("email_value",        "Email 1 - Value"),
         ("email_cta",          "Email 2 - CTA"),
         ("instagram_caption",  "Instagram Caption"),
-        ("sms",                "SMS Blast"),
         ("blog_post",          "Blog Post"),
     ]
 
     for piece_key, piece_label in pieces:
         try:
-            content   = clean(generate_content(piece_key, transcript, episode_title))
+            content   = clean(generate_content(piece_key, plain_transcript, episode_title))
             doc_title = "[SOTA] " + piece_label + " - " + safe_title
             ok        = create_google_doc(doc_title, content, folder_name)
             if ok:
