@@ -228,7 +228,7 @@ def run_pipeline(episode_title, audio_url):
     episode_title = clean(episode_title)
     log.info("Pipeline start - '%s'", episode_title)
     safe_title  = episode_title[:60].strip()
-    folder_name = "SOTA Podcast - " + safe_title
+    folder_name = safe_title
     results     = {"episode": episode_title, "docs": [], "errors": []}
 
     try:
