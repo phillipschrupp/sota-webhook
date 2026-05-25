@@ -1,16 +1,29 @@
 """
-SOTA Content Automation - Webhook Server v2
-Receives a podcast episode from Zapier (title + audio URL),
-transcribes via OpenAI Whisper, generates 7 content pieces via Claude,
-creates a Google Doc for each piece.
+SOTA Content Automation - Webhook Server v3
+===========================================
+Two independent pipelines:
+
+1. POST /episode  - Podcast episodes (Spotify RSS via Zapier)
+   - Downloads audio
+   - Whisper transcription (OpenAI)
+   - resemblyzer voice matching against Phil voice reference clip
+     (downloaded from Google Drive on startup)
+   - Extracts Phil-only lines into a voice corpus doc
+   - Generates 5 content pieces + raw transcript in Google Drive
+
+2. POST /discovery - Discovery calls (Zoom VTT/SRT via Zapier)
+   - Parses Zoom transcript (speaker names already embedded)
+   - Generates transcript + consolidated Prospect Summary
 
 Deploy on Render:
   Build command: pip install -r requirements.txt
   Start command: python server.py
-  Env vars: ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_SCRIPT_URL, WEBHOOK_SECRET
+  Env vars: ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_SCRIPT_URL,
+            WEBHOOK_SECRET, HOST_NAME (default: Phil),
+            VOICE_REF_GDRIVE_ID (Google Drive file ID of phil_voice.wav)
 """
 
-import os, json, hmac, hashlib, tempfile, threading, logging, subprocess
+import os, json, hashlib, hmac, tempfile, threading, logging, subprocess, time, datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import Request, urlopen
 import anthropic
@@ -19,13 +32,24 @@ import openai
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("sota")
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
-GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL", "")
-WEBHOOK_SECRET    = os.environ.get("WEBHOOK_SECRET", "")
-PORT              = int(os.environ.get("PORT", 8080))
-WHISPER_LIMIT     = 24 * 1024 * 1024
+# -- Config --
+ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY", "")
+GOOGLE_SCRIPT_URL   = os.environ.get("GOOGLE_SCRIPT_URL", "")
+WEBHOOK_SECRET      = os.environ.get("WEBHOOK_SECRET", "")
+PORT                = int(os.environ.get("PORT", 8080))
+HOST_NAME           = os.environ.get("HOST_NAME", "Phil")
+WHISPER_LIMIT       = 24 * 1024 * 1024
 
+# Google Drive file ID from the share link of phil_voice.wav
+# Share link: https://drive.google.com/file/d/FILE_ID/view -> use FILE_ID
+VOICE_REF_GDRIVE_ID = os.environ.get("VOICE_REF_GDRIVE_ID", "")
+VOICE_REF_PATH      = "/tmp/phil_voice_ref.wav"
+
+PODCAST_FOLDER      = "Podcast Transcripts"
+DISCOVERY_FOLDER    = "Discovery Calls"
+
+#  Brand system prompt 
 BRAND_SYSTEM = (
     "You are the content strategist for SOTA Personal Training, a boutique "
     "personal training gym in Minnetonka, Minnesota. SOTA coaches busy adults 40+ "
@@ -33,121 +57,151 @@ BRAND_SYSTEM = (
     "Brand voice: straight-talking, warm, systems-minded, community-rooted.\n"
     "Tagline: Strength for Life.\n\n"
     "Founder Phil recovered from serious spinal and shoulder injuries through strength "
-    "training. SOTA believes fitness is not punishment - it is a path to reclaiming your life.\n\n"
+    "training. SOTA believes fitness is not punishment - it is a path to reclaiming "
+    "your life.\n\n"
     "Rules:\n"
     "- Never mention the podcast or episode\n"
-    "- Write as a standalone article / post / email\n"
+    "- Write as a standalone article, post, or email\n"
     "- Use 'you' freely. Short sentences. No generic fitness cliches.\n"
     "- Be specific, warm, direct - like a knowledgeable friend."
 )
 
-def p_carousel(t, title):
+#  Content prompts (5 pieces) 
+
+def p_summary_quotes(t, title):
     return (
-        "Write a 5-slide Instagram carousel for SOTA Personal Training based on this content.\n\n"
-        "Format EXACTLY as:\n"
-        "Slide 1: [Hook - bold, scroll-stopping claim or question. Max 15 words.]\n"
-        "[2-3 supporting sentences]\n\n"
-        "Slide 2: [Title]\n[Content]\n\n"
-        "Continue through Slide 5. Slide 5 CTA: Book a free strategy session at sotafitness.com\n\n"
-        "Rules: Each slide works standalone. Slide 1 must stop a scroller cold.\n"
-        "Do NOT mention podcast or episode.\n\n"
-        "CONTENT:\n" + t[:3500]
+        "Read this podcast transcript and produce an Episode Summary with Pull Quotes "
+        "for SOTA Personal Training.\n\n"
+        "Structure EXACTLY as:\n\n"
+        "# Episode Summary: " + title + "\n\n"
+        "## Core Insight\n"
+        "[2-3 sentences capturing the single most valuable idea from this episode. "
+        "Written as a standalone insight, not a summary of the show.]\n\n"
+        "## Key Takeaways\n"
+        "[4-6 bullet points. Each one is a concrete, actionable insight. "
+        "No fluff. Written for a busy adult who wants the useful part fast.]\n\n"
+        "## Pull Quotes\n"
+        "[5 standalone quotes suitable for Instagram Story graphics or social sharing. "
+        "Under 25 words each. Surprising, specific, or emotionally resonant. "
+        "Written in SOTA voice - do not attribute to the podcast.]\n\n"
+        "Do NOT mention podcast, episode number, or guests by name.\n\n"
+        "TRANSCRIPT:\n" + t[:4000]
     )
 
-def p_email_value(t, title):
-    return (
-        "Write Email 1 of a 2-email nurture sequence for SOTA Personal Training.\n"
-        "This email delivers value only - no hard sell.\n"
-        "Audience: warm (familiar with SOTA). Topic derived from: " + title + "\n\n"
-        "Format:\n"
-        "Subject: [compelling subject line]\n\n"
-        "[Body - 150-200 words. Relatable hook. Core insight. Soft teaser for Email 2. Sign off as Phil.]\n\n"
-        "Do NOT mention podcast or episode.\n\n"
-        "CONTENT:\n" + t[:3000]
-    )
-
-def p_email_cta(t, title):
-    return (
-        "Write Email 2 of a 2-email nurture sequence for SOTA Personal Training.\n"
-        "This email follows Email 1 and moves toward a free consultation booking.\n"
-        "Topic derived from: " + title + "\n\n"
-        "Format:\n"
-        "Subject: [follow-up subject line]\n\n"
-        "[Body - 120-160 words. Story or result reinforcing the lesson. "
-        "Natural CTA to book free strategy session at sotafitness.com/discovery-call. Sign off as Phil.]\n\n"
-        "Do NOT mention podcast or episode.\n\n"
-        "CONTENT:\n" + t[:3000]
-    )
-
-def p_caption(t, title):
-    return (
-        "Write an Instagram Reel / Facebook caption for SOTA Personal Training.\n"
-        "Topic derived from: " + title + ". Audience: busy adults 40+.\n\n"
-        "Rules:\n"
-        "- First line hook: max 8 words, must stop the scroll\n"
-        "- 150-250 words total\n"
-        "- Generous line breaks for mobile\n"
-        "- End with 3-5 niche hashtags (#strengthafter40 #fitafter40 style - NOT #fitness)\n"
-        "- Second-to-last paragraph: soft CTA to book free consult at sotafitness.com\n"
-        "- Do NOT mention podcast or episode\n\n"
-        "CONTENT:\n" + t[:2500]
-    )
-
-def p_sms(t, title):
-    return (
-        "Write a single SMS blast for SOTA Personal Training. MAX 160 characters.\n"
-        "Sound like a real person texting, not a brand. Natural CTA to book a free consult.\n"
-        "Topic derived from: " + title + ". Do NOT mention podcast.\n\n"
-        "Reply with ONLY the SMS text - no labels or explanation.\n\n"
-        "CONTENT:\n" + t[:1500]
-    )
 
 def p_blog(t, title):
     return (
         "Write a full blog post for SOTA Personal Training. 700-1000 words.\n\n"
         "CRITICAL RULES:\n"
-        "- Do NOT mention podcast, episode, or as discussed\n"
+        "- Do NOT mention podcast, episode, or 'as discussed'\n"
         "- Standalone educational article written by a SOTA coach\n"
         "- Audience: busy adults 40+ in Minnetonka / Twin Cities area\n\n"
         "FORMAT:\n"
-        "# [Title: specific, benefit-driven]\n\n"
-        "[1-2 sentence hook intro]\n\n"
+        "# [Title: specific, benefit-driven. Not a question.]\n\n"
+        "[1-2 sentence hook. Lead with a relatable frustration or counterintuitive truth.]\n\n"
         "### [Section Heading]\n\n"
-        "[2-4 short paragraphs per section. 3-5 total sections.]\n\n"
+        "[2-4 short paragraphs. Short sentences. Concrete details.]\n\n"
+        "[3-5 total sections with ### headings]\n\n"
         "### The Bottom Line\n\n"
-        "[1-2 tight sentences. One CTA sentence.]\n\n"
-        "### Need help getting started? "
-        "[Click here](https://www.sotafitness.com/contact) to book a free strategy session.\n\n"
-        "VOICE: Use 'you' freely. Bold key phrases. No generic motivational quotes.\n\n"
-        "SOURCE CONTENT (use ideas, do not reference as transcript):\n" + t[:4000]
+        "[1-2 tight sentences that land the core message.]\n\n"
+        "### Ready to build strength that lasts? "
+        "[Book a free strategy session](https://www.sotafitness.com/contact) "
+        "with a SOTA coach.\n\n"
+        "VOICE: Use 'you' freely. **Bold** key phrases. No generic motivational quotes. "
+        "Real numbers, real scenarios, real feelings.\n\n"
+        "SOURCE CONTENT (use the ideas - do not reference as transcript):\n" + t[:4000]
     )
 
-def p_quotes(t, title):
+
+def p_email(t, title):
     return (
-        "Extract 4-5 powerful pull quotes from this content for SOTA Personal Training.\n"
-        "Each quote works as a standalone Instagram Story graphic or shareable image.\n\n"
-        "Rules:\n"
-        "- Under 25 words each\n"
-        "- Surprising, counterintuitive, or emotionally resonant\n"
-        "- Rewrite in SOTA voice if needed\n"
+        "Write a single high-value marketing email for SOTA Personal Training.\n\n"
+        "PURPOSE: Convert non-members on the email list. "
+        "This email must earn attention, deliver a genuine insight, and make "
+        "booking a free consultation feel like the obvious next step - not a sales pitch.\n\n"
+        "AUDIENCE: Busy adults 40+ who are on the SOTA email list but have not yet joined. "
+        "They are skeptical, time-poor, and have probably tried other fitness programs before.\n\n"
+        "FORMAT:\n"
+        "Subject: [Compelling subject line - specific, curiosity-driven, no hype words]\n"
+        "Preview: [40-char preview text that complements the subject line]\n\n"
+        "[Opening hook - 1-2 sentences. Lead with a specific situation or truth "
+        "that makes the reader feel seen. No 'I hope this email finds you well'.]\n\n"
+        "[Core insight - 3-4 short paragraphs. Deliver the most valuable idea from "
+        "the content. Write like a trusted coach sharing something genuinely useful. "
+        "No padding.]\n\n"
+        "[Transition - 1-2 sentences naturally connecting the insight to the invitation.]\n\n"
+        "[CTA - One sentence. Warm, direct, low-pressure. "
+        "Link to: https://www.sotafitness.com/contact]\n\n"
+        "Phil\n\n"
+        "RULES:\n"
         "- Do NOT mention podcast or episode\n"
-        "- Format as a numbered list\n\n"
-        "CONTENT:\n" + t[:3000]
+        "- No exclamation marks\n"
+        "- No 'transform', 'journey', 'crush', 'grind', 'hustle'\n"
+        "- Total length: 200-280 words\n"
+        "- Sign off as Phil, not 'The SOTA Team'\n\n"
+        "SOURCE CONTENT:\n" + t[:3500]
     )
+
+
+def p_instagram(t, title):
+    return (
+        "Write a complete Instagram content package for SOTA Personal Training "
+        "based on this content. Topic: " + title + ".\n\n"
+        "Produce TWO sections in a single document:\n\n"
+        "## Carousel Copy\n\n"
+        "Write 5 slides for an Instagram carousel.\n\n"
+        "Slide 1: [Hook - scroll-stopping claim or question. Max 12 words. "
+        "Must make someone stop mid-scroll.]\n"
+        "[2-3 sentences expanding the hook. Sets up the rest of the carousel.]\n\n"
+        "Slide 2: [Title]\n[Content - 2-4 short lines]\n\n"
+        "Slide 3: [Title]\n[Content - 2-4 short lines]\n\n"
+        "Slide 4: [Title]\n[Content - 2-4 short lines]\n\n"
+        "Slide 5: [CTA slide]\n"
+        "Ready to build strength that fits your actual life?\n"
+        "Book a free strategy session at sotafitness.com\n\n"
+        "Rules: Each slide works as a standalone idea. No jargon. "
+        "Write for a 47-year-old professional, not a 22-year-old athlete.\n\n"
+        "## Post Caption\n\n"
+        "Write a caption for the carousel post or a standalone Reel.\n\n"
+        "Rules:\n"
+        "- First line: max 8 words, must stop the scroll\n"
+        "- 150-220 words total\n"
+        "- Generous line breaks for mobile reading\n"
+        "- Second-to-last paragraph: soft CTA to book free consult at sotafitness.com\n"
+        "- Last line: 3-4 niche hashtags (#strengthafter40 #fitafter40 style)\n"
+        "- Do NOT mention podcast or episode\n\n"
+        "SOURCE CONTENT:\n" + t[:3000]
+    )
+
 
 PROMPTS = {
-    "instagram_carousel": p_carousel,
-    "email_value":        p_email_value,
-    "email_cta":          p_email_cta,
-    "instagram_caption":  p_caption,
-    "sms":                p_sms,
-    "blog_post":          p_blog,
-    "pull_quotes":        p_quotes,
+    "summary_quotes": p_summary_quotes,
+    "blog_post":      p_blog,
+    "email":          p_email,
+    "instagram":      p_instagram,
 }
 
+PODCAST_PIECES = [
+    ("summary_quotes", "Episode Summary and Pull Quotes"),
+    ("blog_post",      "Blog Post"),
+    ("email",          "Marketing Email"),
+    ("instagram",      "Instagram Carousel and Caption"),
+]
+
+#  Utility 
 def clean(text):
-    """Remove all non-ASCII characters."""
     return text.encode("ascii", "ignore").decode("ascii")
+
+
+#  Audio download + compression 
+def download_audio(audio_url):
+    log.info("Downloading audio: %s", audio_url[:80])
+    req = Request(audio_url, headers={"User-Agent": "Mozilla/5.0 (compatible; SOTA-Bot/1.0)"})
+    with urlopen(req, timeout=120) as resp:
+        audio_data = resp.read()
+    log.info("Downloaded %.1f MB", len(audio_data) / 1024 / 1024)
+    return audio_data
+
 
 def compress_audio(input_path):
     output_path = input_path + "_c.mp3"
@@ -159,92 +213,308 @@ def compress_audio(input_path):
     log.info("Compressed to %.1f MB", os.path.getsize(output_path) / 1024 / 1024)
     return output_path
 
-def transcribe_audio(audio_url):
-    log.info("Downloading audio: %s", audio_url[:80])
-    req = Request(audio_url, headers={"User-Agent": "Mozilla/5.0 (compatible; SOTA-Bot/1.0)"})
-    with urlopen(req, timeout=120) as resp:
-        audio_data = resp.read()
-    log.info("Downloaded %.1f MB", len(audio_data) / 1024 / 1024)
 
+def save_audio_temp(audio_data, audio_url):
     suffix = ".m4a" if audio_url.lower().endswith(".m4a") else (
              ".wav" if audio_url.lower().endswith(".wav") else ".mp3")
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(audio_data)
-        tmp_path = tmp.name
+        return tmp.name
 
-    compressed_path = None
+
+#  Voice identification with resemblyzer 
+def identify_host_speaker(audio_path, speaker_labels, utterances):
+    """
+    Use resemblyzer to compare each speaker's audio segments against
+    Phil's reference voice clip. Returns the speaker label that best
+    matches Phil's voice.
+    Falls back to first-speaker heuristic if resemblyzer unavailable
+    or reference clip not found.
+    """
+    # Check prerequisites
+    if not os.path.exists(VOICE_REF_PATH):
+        log.warning("Voice reference clip not found at %s - using first-speaker fallback", VOICE_REF_PATH)
+        return _first_speaker_fallback(utterances)
+
     try:
-        if len(audio_data) > WHISPER_LIMIT:
-            log.info("File exceeds 24 MB - compressing with ffmpeg...")
-            compressed_path = compress_audio(tmp_path)
-            send_path = compressed_path
+        from resemblyzer import VoiceEncoder, preprocess_wav
+        from pathlib import Path
+        import numpy as np
+
+        log.info("Loading resemblyzer encoder...")
+        encoder = VoiceEncoder()
+
+        # Embed Phil's reference voice
+        ref_wav = preprocess_wav(Path(VOICE_REF_PATH))
+        ref_embed = encoder.embed_utterance(ref_wav)
+        log.info("Reference voice embedded.")
+
+        # For each speaker, extract a sample segment and embed it
+        # We use the longest utterance per speaker for best accuracy
+        best_match   = None
+        best_score   = -1.0
+
+        for label in speaker_labels:
+            # Find the longest utterance for this speaker
+            speaker_utts = [u for u in utterances if u.get("speaker") == label]
+            if not speaker_utts:
+                continue
+
+            longest = max(speaker_utts, key=lambda u: u.get("end", 0) - u.get("start", 0))
+            start_ms = longest.get("start", 0)
+            end_ms   = longest.get("end", start_ms + 10000)
+
+            # Extract that segment with ffmpeg
+            seg_path = audio_path + "_spk_" + label + ".wav"
+            start_s  = start_ms / 1000.0
+            dur_s    = min((end_ms - start_ms) / 1000.0, 30.0)  # cap at 30s
+
+            cmd = [
+                "ffmpeg", "-y", "-i", audio_path,
+                "-ss", str(start_s), "-t", str(dur_s),
+                "-ac", "1", "-ar", "16000",
+                seg_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, timeout=60)
+            if result.returncode != 0:
+                log.warning("ffmpeg segment extract failed for speaker %s", label)
+                continue
+
+            try:
+                seg_wav   = preprocess_wav(Path(seg_path))
+                seg_embed = encoder.embed_utterance(seg_wav)
+                # Cosine similarity
+                score = float(np.dot(ref_embed, seg_embed) /
+                              (np.linalg.norm(ref_embed) * np.linalg.norm(seg_embed)))
+                log.info("Speaker %s similarity to Phil: %.3f", label, score)
+                if score > best_score:
+                    best_score = score
+                    best_match = label
+            finally:
+                if os.path.exists(seg_path):
+                    os.unlink(seg_path)
+
+        if best_match and best_score > 0.75:
+            log.info("Voice match: %s identified as %s (score: %.3f)", best_match, HOST_NAME, best_score)
+            return best_match
         else:
-            send_path = tmp_path
+            log.warning("No confident voice match (best: %.3f) - using first-speaker fallback", best_score)
+            return _first_speaker_fallback(utterances)
 
-        client = openai.OpenAI(api_key=OPENAI_API_KEY)
-
-        # First pass: verbose JSON with word-level timestamps for speaker formatting
-        log.info("Sending to Whisper (verbose)...")
-        with open(send_path, "rb") as f:
-            verbose_result = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                response_format="verbose_json",
-                timestamp_granularities=["segment"]
-            )
-
-        # Build formatted transcript with timestamps and inferred speakers
-        formatted = format_transcript(verbose_result)
-
-        # Plain transcript for Claude content generation
-        plain = " ".join(seg.text.strip() for seg in verbose_result.segments)
-
-        log.info("Transcription complete - %d chars", len(plain))
-        return plain, formatted
-
-    finally:
-        os.unlink(tmp_path)
-        if compressed_path and os.path.exists(compressed_path):
-            os.unlink(compressed_path)
+    except ImportError:
+        log.warning("resemblyzer not installed - using first-speaker fallback")
+        return _first_speaker_fallback(utterances)
+    except Exception as e:
+        log.warning("Voice identification failed (%s) - using first-speaker fallback", e)
+        return _first_speaker_fallback(utterances)
 
 
-def format_transcript(verbose_result):
+def _first_speaker_fallback(utterances):
+    """Return the speaker label that appears first in the transcript."""
+    if not utterances:
+        return "A"
+    first = min(utterances, key=lambda u: u.get("start", 0))
+    label = first.get("speaker", "A")
+    log.info("First-speaker fallback: %s -> %s", label, HOST_NAME)
+    return label
+
+
+# -- Startup: download Phil voice reference from Google Drive --
+def download_voice_reference():
+    """Download Phil voice reference clip from Google Drive on server startup."""
+    if not VOICE_REF_GDRIVE_ID:
+        log.warning("VOICE_REF_GDRIVE_ID not set - voice matching unavailable")
+        return False
+    if os.path.exists(VOICE_REF_PATH):
+        log.info("Voice reference already cached at %s", VOICE_REF_PATH)
+        return True
+    try:
+        url = "https://drive.google.com/uc?export=download&id=" + VOICE_REF_GDRIVE_ID
+        log.info("Downloading voice reference from Google Drive...")
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=30) as resp:
+            data = resp.read()
+        with open(VOICE_REF_PATH, "wb") as f:
+            f.write(data)
+        log.info("Voice reference saved: %d bytes", len(data))
+        return True
+    except Exception as e:
+        log.error("Failed to download voice reference: %s", e)
+        return False
+
+
+# -- Whisper transcription --
+def transcribe_whisper(audio_path):
+    """Transcribe audio using OpenAI Whisper with verbose JSON for segment timestamps."""
+    log.info("Sending to Whisper...")
+    client = openai.OpenAI(api_key=OPENAI_API_KEY)
+    with open(audio_path, "rb") as f:
+        result = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=f,
+            response_format="verbose_json",
+            timestamp_granularities=["segment"]
+        )
+    segments = result.segments if hasattr(result, "segments") else []
+    plain = " ".join(seg.text.strip() for seg in segments)
+    log.info("Whisper complete - %d chars, %d segments", len(plain), len(segments))
+    return plain, segments
+
+
+# -- Voice identification with resemblyzer --
+def identify_host_segments(audio_path, segments):
     """
-    Format Whisper verbose JSON into a readable transcript.
-    Whisper-1 does not natively identify speakers, so we label
-    segments as Speaker 1 / Speaker 2 using a simple heuristic:
-    long pauses (>1.5s gap between segments) suggest a speaker change.
-    For a podcast with two hosts this produces a clean readable doc.
+    Use resemblyzer to compare each Whisper segment against Phil voice reference.
+    Returns a list of booleans: True = this segment is Phil speaking.
+    Falls back to first-speaker heuristic if resemblyzer unavailable.
     """
-    segments = verbose_result.segments
+    if not os.path.exists(VOICE_REF_PATH):
+        log.warning("Voice reference not found - using first-speaker fallback")
+        return _first_speaker_fallback_segments(segments)
+
+    try:
+        from resemblyzer import VoiceEncoder, preprocess_wav
+        from pathlib import Path
+        import numpy as np
+
+        log.info("Loading resemblyzer encoder...")
+        encoder   = VoiceEncoder()
+        ref_wav   = preprocess_wav(Path(VOICE_REF_PATH))
+        ref_embed = encoder.embed_utterance(ref_wav)
+        log.info("Reference voice embedded.")
+
+        is_host = []
+        for seg in segments:
+            start_s = seg.start
+            dur_s   = min(seg.end - seg.start, 20.0)
+            if dur_s < 1.0:
+                is_host.append(None)
+                continue
+
+            seg_path = audio_path + "_seg.wav"
+            cmd = ["ffmpeg", "-y", "-i", audio_path,
+                   "-ss", str(start_s), "-t", str(dur_s),
+                   "-ac", "1", "-ar", "16000", seg_path]
+            result = subprocess.run(cmd, capture_output=True, timeout=30)
+            if result.returncode != 0:
+                is_host.append(None)
+                continue
+
+            try:
+                seg_wav   = preprocess_wav(Path(seg_path))
+                seg_embed = encoder.embed_utterance(seg_wav)
+                score = float(np.dot(ref_embed, seg_embed) /
+                              (np.linalg.norm(ref_embed) * np.linalg.norm(seg_embed)))
+                is_host.append(score > 0.72)
+            except Exception:
+                is_host.append(None)
+            finally:
+                if os.path.exists(seg_path):
+                    os.unlink(seg_path)
+
+        host_count  = sum(1 for v in is_host if v is True)
+        guest_count = sum(1 for v in is_host if v is False)
+        log.info("Voice ID complete: %d host segments, %d guest segments, %d unclear",
+                 host_count, guest_count, sum(1 for v in is_host if v is None))
+        return is_host
+
+    except ImportError:
+        log.warning("resemblyzer not installed - using first-speaker fallback")
+        return _first_speaker_fallback_segments(segments)
+    except Exception as e:
+        log.warning("Voice ID failed (%s) - using first-speaker fallback", e)
+        return _first_speaker_fallback_segments(segments)
+
+
+def _first_speaker_fallback_segments(segments):
+    """
+    Fallback: alternate host/guest based on natural pause gaps.
+    First speaker = Phil. Speaker changes on pauses > 1.5s.
+    """
     if not segments:
-        return ""
-
-    lines = []
-    current_speaker = 1
-    prev_end = 0.0
-    PAUSE_THRESHOLD = 1.5  # seconds gap = likely speaker change
-
+        return []
+    is_host     = []
+    current     = True
+    prev_end    = 0.0
+    PAUSE_THRESH = 1.5
     for seg in segments:
-        start = seg.start
-        text  = seg.text.strip()
+        if seg.start - prev_end > PAUSE_THRESH and prev_end > 0:
+            current = not current
+        is_host.append(current)
+        prev_end = seg.end
+    return is_host
+
+
+def build_formatted_transcript(segments, is_host):
+    """Build full formatted transcript with Phil / Guest labels and timestamps."""
+    lines = []
+    for seg, host in zip(segments, is_host):
+        text = seg.text.strip()
         if not text:
             continue
+        mins = int(seg.start // 60)
+        secs = int(seg.start % 60)
+        if host is True:
+            label = "**" + HOST_NAME + "** [%02d:%02d]" % (mins, secs)
+        elif host is False:
+            label = "**Guest** [%02d:%02d]" % (mins, secs)
+        else:
+            label = "[%02d:%02d]" % (mins, secs)
+        lines.append(label + "
+" + text)
+    return "
 
-        # Detect speaker change on significant pause
-        if (start - prev_end) > PAUSE_THRESHOLD and prev_end > 0:
-            current_speaker = 2 if current_speaker == 1 else 1
+".join(lines)
 
-        # Format timestamp as MM:SS
-        mins = int(start // 60)
-        secs = int(start % 60)
-        timestamp = "[%02d:%02d]" % (mins, secs)
 
-        lines.append("Speaker %d %s: %s" % (current_speaker, timestamp, text))
-        prev_end = seg.end
+def build_phil_corpus(segments, is_host, episode_title):
+    """
+    Extract only Phil's lines, clean them into flowing paragraphs.
+    Strips timestamps. Groups consecutive Phil segments into paragraphs.
+    This becomes the voice training corpus doc.
+    """
+    phil_chunks = []
+    current_chunk = []
 
-    return "\n\n".join(lines)
+    for seg, host in zip(segments, is_host):
+        text = seg.text.strip()
+        if not text:
+            continue
+        if host is True:
+            current_chunk.append(text)
+        else:
+            if current_chunk:
+                phil_chunks.append(" ".join(current_chunk))
+                current_chunk = []
 
+    if current_chunk:
+        phil_chunks.append(" ".join(current_chunk))
+
+    if not phil_chunks:
+        return None
+
+    header  = "# " + HOST_NAME + " Voice Corpus: " + episode_title + "
+
+"
+    header += "## About This Document
+
+"
+    header += "This document contains only " + HOST_NAME + "'s spoken words from this episode, "
+    header += "cleaned into flowing paragraphs without timestamps or guest dialogue. "
+    header += "It is used to train Claude to write in " + HOST_NAME + "'s voice and tone.
+
+"
+    header += "---
+
+"
+    body = "
+
+".join(phil_chunks)
+    return header + body
+
+
+# -- Content generation --
+#  Content generation 
 def generate_content(piece_name, transcript, episode_title):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     fn = PROMPTS.get(piece_name)
@@ -253,15 +523,18 @@ def generate_content(piece_name, transcript, episode_title):
     log.info("Generating %s...", piece_name)
     msg = client.messages.create(
         model="claude-opus-4-5",
-        max_tokens=1500,
+        max_tokens=2000,
         system=BRAND_SYSTEM,
         messages=[{"role": "user", "content": fn(transcript, episode_title)}],
     )
     return msg.content[0].text.strip()
 
-def create_google_doc(title, content, folder):
+
+#  Google Doc creation 
+def create_google_doc(title, content, folder, master_folder=None):
     payload = json.dumps(
-        {"title": title, "content": content, "folder": folder},
+        {"title": title, "content": content,
+         "folder": folder, "master_folder": master_folder or ""},
         ensure_ascii=False
     ).encode("utf-8")
     req = Request(GOOGLE_SCRIPT_URL, data=payload,
@@ -275,51 +548,66 @@ def create_google_doc(title, content, folder):
         log.error("Doc creation failed for '%s': %s", title, e)
         return False
 
-def run_pipeline(episode_title, audio_url):
+
+#  Podcast pipeline 
+def run_podcast_pipeline(episode_title, audio_url):
     episode_title = clean(episode_title)
-    log.info("Pipeline start - '%s'", episode_title)
+    log.info("Podcast pipeline start - '%s'", episode_title)
     safe_title  = episode_title[:60].strip()
-    folder_name = safe_title
     results     = {"episode": episode_title, "docs": [], "errors": []}
 
+    # Download audio (needed for voice ID even though AssemblyAI gets the URL)
+    audio_path = None
     try:
-        plain_transcript, formatted_transcript = transcribe_audio(audio_url)
-        plain_transcript     = clean(plain_transcript)
-        formatted_transcript = clean(formatted_transcript)
+        audio_data = download_audio(audio_url)
+        audio_path = save_audio_temp(audio_data, audio_url)
+
+        # Compress if needed for local voice ID processing
+        if len(audio_data) > WHISPER_LIMIT:
+            log.info("Compressing for voice ID processing...")
+            compressed = compress_audio(audio_path)
+            process_path = compressed
+        else:
+            process_path = audio_path
+
+        # Transcribe via AssemblyAI
+        plain, utterances, speaker_labels = transcribe_assemblyai(audio_url, process_path)
+        plain = clean(plain)
+
+        # Identify Phil's voice
+        host_label = identify_host_speaker(process_path, speaker_labels, utterances)
+
+        # Build formatted transcript with real names
+        formatted = clean(build_formatted_transcript(utterances, host_label))
+
     except Exception as e:
-        log.error("Transcription failed: %s", e)
+        log.error("Transcription/voice ID failed: %s", e)
         results["errors"].append("Transcription: " + str(e))
         return results
+    finally:
+        if audio_path and os.path.exists(audio_path):
+            os.unlink(audio_path)
 
-    # Save raw transcript as first doc in the folder
+    # 1. Save raw transcript
     transcript_title = "[SOTA] Transcript - " + safe_title
-    header = "# " + episode_title + "\n\n"
+    header  = "# " + episode_title + "\n\n"
     header += "## Full Episode Transcript\n\n"
-    header += "Note: Speaker labels are auto-detected based on pause patterns.\n"
-    header += "Verify against the recording if exact attribution is needed.\n\n"
+    header += "Speaker identification by voice matching.\n\n"
     header += "---\n\n"
-    ok = create_google_doc(transcript_title, header + formatted_transcript, folder_name)
+    ok = create_google_doc(transcript_title, header + formatted, safe_title,
+                           master_folder=PODCAST_FOLDER)
     if ok:
         results["docs"].append(transcript_title)
-        log.info("Transcript doc saved.")
     else:
         results["errors"].append("Transcript: doc creation failed")
 
-    # Generate all 7 content pieces using plain transcript
-    pieces = [
-        ("instagram_carousel", "Instagram Carousel"),
-        ("pull_quotes",        "Pull Quotes"),
-        ("email_value",        "Email 1 - Value"),
-        ("email_cta",          "Email 2 - CTA"),
-        ("instagram_caption",  "Instagram Caption"),
-        ("blog_post",          "Blog Post"),
-    ]
-
-    for piece_key, piece_label in pieces:
+    # 2-5. Generate content pieces
+    for piece_key, piece_label in PODCAST_PIECES:
         try:
-            content   = clean(generate_content(piece_key, plain_transcript, episode_title))
+            content   = clean(generate_content(piece_key, plain, episode_title))
             doc_title = "[SOTA] " + piece_label + " - " + safe_title
-            ok        = create_google_doc(doc_title, content, folder_name)
+            ok        = create_google_doc(doc_title, content, safe_title,
+                                          master_folder=PODCAST_FOLDER)
             if ok:
                 results["docs"].append(doc_title)
             else:
@@ -328,9 +616,244 @@ def run_pipeline(episode_title, audio_url):
             log.error("Error on %s: %s", piece_key, e)
             results["errors"].append(piece_label + ": " + str(e))
 
-    log.info("Pipeline done - %d docs, %d errors", len(results["docs"]), len(results["errors"]))
+    log.info("Podcast pipeline done - %d docs, %d errors",
+             len(results["docs"]), len(results["errors"]))
     return results
 
+
+#  Transcript parsers (Discovery calls) 
+def _parse_blocks(lines):
+    plain_lines = []
+    formatted_lines = []
+    current_speaker = None
+    current_text    = []
+    current_time    = None
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if "-->" in line:
+            if current_text:
+                block_text = " ".join(current_text).strip()
+                if block_text:
+                    plain_lines.append(block_text)
+                    label = ("**" + current_speaker + "** " + current_time + "\n") \
+                            if current_speaker else (current_time + " ")
+                    formatted_lines.append(label + block_text)
+                current_text = []
+            ts = line.split("-->")[0].strip().replace(",", ".")
+            parts = ts.split(":")
+            try:
+                if len(parts) == 3:
+                    h, m, s = parts
+                    total_secs = int(h)*3600 + int(m)*60 + float(s)
+                else:
+                    m, s = parts
+                    total_secs = int(m)*60 + float(s)
+                current_time = "[%02d:%02d]" % (int(total_secs//60), int(total_secs%60))
+            except Exception:
+                current_time = ""
+            i += 1
+            continue
+        if line.isdigit() or not line:
+            i += 1
+            continue
+        if ":" in line and len(line.split(":")[0]) < 40:
+            spk = line.split(":")[0].strip()
+            if "-->" not in spk and not spk.isdigit() and spk.upper() != "WEBVTT":
+                current_speaker = spk
+                line = ":".join(line.split(":")[1:]).strip()
+        if line:
+            current_text.append(line)
+        i += 1
+    if current_text:
+        block_text = " ".join(current_text).strip()
+        if block_text:
+            plain_lines.append(block_text)
+            label = ("**" + current_speaker + "** " + current_time + "\n") \
+                    if current_speaker else (current_time + " ")
+            formatted_lines.append(label + block_text)
+    return " ".join(plain_lines), "\n\n".join(formatted_lines)
+
+
+def parse_srt(t):
+    return _parse_blocks(t.strip().splitlines())
+
+def parse_vtt(t):
+    lines = [l for l in t.strip().splitlines() if l.strip() != "WEBVTT"]
+    return _parse_blocks(lines)
+
+def parse_transcript(text):
+    text = text.strip()
+    if "WEBVTT" in text[:50]:
+        return parse_vtt(text)
+    elif "-->" in text:
+        first_ts = [l for l in text.splitlines() if "-->" in l]
+        if first_ts and "," in first_ts[0].split("-->")[0]:
+            return parse_srt(text)
+        return parse_vtt(text)
+    return text, text
+
+
+#  Discovery call pipeline 
+DISCOVERY_SYSTEM = (
+    "You are a senior coach analyst for SOTA Personal Training, a boutique "
+    "personal training gym in Minnetonka, Minnesota specializing in adults 40+.\n\n"
+    "Your job is to read discovery call transcripts and extract structured, "
+    "actionable information that helps Phil and the SOTA coaching team "
+    "understand the prospect and craft the right approach.\n\n"
+    "Be specific and direct. Pull exact quotes where relevant. "
+    "Flag anything that signals readiness, hesitation, or a strong fit."
+)
+
+
+def dc_extract_name(t):
+    return (
+        "Read the first part of this discovery call transcript and extract the "
+        "prospect's first and last name.\n\n"
+        "Look for how Phil greets them at the start of the call. "
+        "Examples: 'Hey Sarah', 'Thanks for joining Jane', 'Great to meet you John Smith'.\n\n"
+        "Reply with ONLY the prospect's name - nothing else. "
+        "If you cannot find a name, reply with exactly: Unknown.\n\n"
+        "TRANSCRIPT (first 1500 chars):\n" + t[:1500]
+    )
+
+
+def dc_full_summary(t, name):
+    return (
+        "Read this discovery call transcript and produce a complete Prospect Summary "
+        "document for " + name + " at SOTA Personal Training.\n\n"
+        "Use this structure exactly:\n\n"
+        "# Prospect Summary: " + name + "\n\n"
+        "## Overview\n"
+        "- Name and personal context (job, family, lifestyle)\n"
+        "- Why they reached out and what prompted the call\n"
+        "- Fitness history in brief\n"
+        "- Readiness to commit: High / Medium / Low (one sentence reasoning)\n"
+        "- Key quote that reveals their mindset\n\n"
+        "## Goals\n\n"
+        "### Primary Goal\n"
+        "[Single biggest stated goal]\n\n"
+        "### Secondary Goals\n"
+        "[2-4 additional goals]\n\n"
+        "### Deeper Why\n"
+        "[Emotional or life reason. Pull quotes where possible.]\n\n"
+        "### Timeline Expectations\n"
+        "[What timeframe? Realistic or not?]\n\n"
+        "## Pain Points\n\n"
+        "### Primary Pain Point\n"
+        "[Biggest frustration or obstacle]\n\n"
+        "### Other Pain Points\n"
+        "[Additional frustrations]\n\n"
+        "### Previous Attempts\n"
+        "[What have they tried? What worked, what did not, why did they stop?]\n\n"
+        "### Hidden Objections\n"
+        "[Hesitations hinted at - price, time, skepticism, fear of injury, past failure]\n\n"
+        "## Injury and Health History\n\n"
+        "### Known Injuries or Conditions\n"
+        "[Each one with details - severity, current status, duration]\n\n"
+        "### Movement Limitations\n"
+        "[Exercises or positions they avoid or struggle with]\n\n"
+        "### Medical Clearance\n"
+        "[Doctors, physios, surgeries, medications, pending medical things]\n\n"
+        "### Coaching Flags\n"
+        "[Things to assess in person before programming]\n\n"
+        "## Proposal Outline\n\n"
+        "### Recommended Program\n"
+        "[1-on-1, small group, or online? Why?]\n\n"
+        "### Suggested Starting Point\n"
+        "[Phase, frequency, and focus given their history and goals]\n\n"
+        "### Key Coaching Priorities (First 90 Days)\n"
+        "[2-4 specific priorities from this call]\n\n"
+        "### How to Frame the Value\n"
+        "[Most compelling way to present SOTA to this specific person. "
+        "What language resonates with them?]\n\n"
+        "### Suggested Next Step\n"
+        "[What should Phil say or send to move this prospect forward?]\n\n"
+        "If nothing was mentioned in a category, write: None disclosed.\n"
+        "Pull direct quotes where they add weight.\n\n"
+        "TRANSCRIPT:\n" + t[:5000]
+    )
+
+
+def extract_prospect_name(transcript):
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    msg = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=20,
+        system="You extract names from text. Reply with only the name or Unknown.",
+        messages=[{"role": "user", "content": dc_extract_name(transcript)}],
+    )
+    name = msg.content[0].text.strip()
+    if not name or name.lower() == "unknown" or len(name) > 50:
+        return None
+    return name
+
+
+def run_discovery_pipeline(meeting_title, plain_transcript, formatted_transcript):
+    meeting_title        = clean(meeting_title)
+    plain_transcript     = clean(plain_transcript)
+    formatted_transcript = clean(formatted_transcript)
+
+    log.info("Discovery pipeline start - '%s'", meeting_title)
+    results = {"meeting": meeting_title, "docs": [], "errors": []}
+
+    # Extract prospect name from transcript
+    log.info("Extracting prospect name...")
+    try:
+        prospect_name = extract_prospect_name(plain_transcript)
+    except Exception as e:
+        log.warning("Name extraction failed: %s", e)
+        prospect_name = None
+
+    if not prospect_name:
+        date_str = datetime.date.today().strftime("%Y-%m-%d")
+        prospect_name = "Unknown Prospect " + date_str
+        log.info("Name not found - using fallback: %s", prospect_name)
+    else:
+        log.info("Prospect identified as: %s", prospect_name)
+
+    folder_name = "Discovery Call - " + prospect_name
+
+    # Save transcript
+    transcript_title = "[SOTA] Transcript - " + prospect_name
+    header  = "# Discovery Call: " + prospect_name + "\n\n"
+    header += "## Full Call Transcript\n\n"
+    header += "Speaker labels from Zoom recording.\n\n"
+    header += "---\n\n"
+    ok = create_google_doc(transcript_title, header + formatted_transcript,
+                           folder_name, master_folder=DISCOVERY_FOLDER)
+    if ok:
+        results["docs"].append(transcript_title)
+    else:
+        results["errors"].append("Transcript: doc creation failed")
+
+    # Generate consolidated Prospect Summary
+    try:
+        client  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        msg     = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=2000,
+            system=DISCOVERY_SYSTEM,
+            messages=[{"role": "user", "content": dc_full_summary(plain_transcript, prospect_name)}],
+        )
+        summary = clean(msg.content[0].text.strip())
+        doc_title = "[SOTA] Prospect Summary - " + prospect_name
+        ok = create_google_doc(doc_title, summary, folder_name,
+                               master_folder=DISCOVERY_FOLDER)
+        if ok:
+            results["docs"].append(doc_title)
+        else:
+            results["errors"].append("Prospect Summary: doc creation failed")
+    except Exception as e:
+        log.error("Error generating Prospect Summary: %s", e)
+        results["errors"].append("Prospect Summary: " + str(e))
+
+    log.info("Discovery pipeline done - %d docs, %d errors",
+             len(results["docs"]), len(results["errors"]))
+    return results
+
+
+#  HTTP handler 
 class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
@@ -351,43 +874,73 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self.send_json(200, {"status": "ok", "service": "SOTA Content Automation v2"})
+            self.send_json(200, {"status": "ok", "service": "SOTA Content Automation v3"})
         else:
             self.send_json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path != "/episode":
-            self.send_json(404, {"error": "not found"})
-            return
         length = int(self.headers.get("Content-Length", 0))
         body   = self.rfile.read(length)
+
         if not self.verify_secret(body):
             self.send_json(401, {"error": "invalid secret"})
             return
+
         try:
             payload = json.loads(body)
         except json.JSONDecodeError:
             self.send_json(400, {"error": "invalid JSON"})
             return
-        episode_title = payload.get("title", "").strip()
-        audio_url     = payload.get("audio_url", "").strip()
-        if not episode_title:
-            self.send_json(400, {"error": "missing title"})
-            return
-        if not audio_url:
-            self.send_json(400, {"error": "missing audio_url"})
-            return
-        self.send_json(202, {"status": "accepted", "episode": episode_title})
-        threading.Thread(target=run_pipeline, args=(episode_title, audio_url), daemon=True).start()
 
+        #  Podcast episode 
+        if self.path == "/episode":
+            title     = payload.get("title", "").strip()
+            audio_url = payload.get("audio_url", "").strip()
+            if not title:
+                self.send_json(400, {"error": "missing title"})
+                return
+            if not audio_url:
+                self.send_json(400, {"error": "missing audio_url"})
+                return
+            self.send_json(202, {"status": "accepted", "episode": title})
+            threading.Thread(target=run_podcast_pipeline,
+                             args=(title, audio_url), daemon=True).start()
+
+        #  Discovery call 
+        elif self.path == "/discovery":
+            title          = payload.get("title", "").strip()
+            vtt_transcript = payload.get("transcript", "").strip()
+            if not title:
+                self.send_json(400, {"error": "missing title"})
+                return
+            if len(vtt_transcript) < 50:
+                self.send_json(400, {"error": "transcript too short"})
+                return
+            self.send_json(202, {"status": "accepted", "meeting": title})
+
+            def discovery_job():
+                plain, formatted = parse_transcript(vtt_transcript)
+                run_discovery_pipeline(title, plain, formatted)
+
+            threading.Thread(target=discovery_job, daemon=True).start()
+
+        else:
+            self.send_json(404, {"error": "not found"})
+
+
+#  Entry point 
 if __name__ == "__main__":
     if not ANTHROPIC_API_KEY: log.warning("ANTHROPIC_API_KEY not set")
     if not OPENAI_API_KEY:    log.warning("OPENAI_API_KEY not set")
     if not GOOGLE_SCRIPT_URL: log.warning("GOOGLE_SCRIPT_URL not set")
+
+    # Download Phil voice reference clip from Google Drive on startup
+    download_voice_reference()
+
     server = HTTPServer(("0.0.0.0", PORT), Handler)
-    log.info("SOTA Webhook Server v2 running on port %d", PORT)
-    log.info("Endpoint: POST /episode  (fields: title, audio_url)")
-    log.info("Health:   GET  /health")
+    log.info("SOTA Content Automation v3 running on port %d", PORT)
+    log.info("Endpoints: POST /episode | POST /discovery")
+    log.info("Health:    GET  /health")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
