@@ -460,11 +460,8 @@ def build_formatted_transcript(segments, is_host):
             label = "**Guest** [%02d:%02d]" % (mins, secs)
         else:
             label = "[%02d:%02d]" % (mins, secs)
-        lines.append(label + "
-" + text)
-    return "
-
-".join(lines)
+        lines.append(label + "\n" + text)
+    return "\n\n".join(lines)
 
 
 def build_phil_corpus(segments, is_host, episode_title):
@@ -473,7 +470,7 @@ def build_phil_corpus(segments, is_host, episode_title):
     Strips timestamps. Groups consecutive Phil segments into paragraphs.
     This becomes the voice training corpus doc.
     """
-    phil_chunks = []
+    phil_chunks   = []
     current_chunk = []
 
     for seg, host in zip(segments, is_host):
@@ -493,28 +490,18 @@ def build_phil_corpus(segments, is_host, episode_title):
     if not phil_chunks:
         return None
 
-    header  = "# " + HOST_NAME + " Voice Corpus: " + episode_title + "
-
-"
-    header += "## About This Document
-
-"
-    header += "This document contains only " + HOST_NAME + "'s spoken words from this episode, "
-    header += "cleaned into flowing paragraphs without timestamps or guest dialogue. "
-    header += "It is used to train Claude to write in " + HOST_NAME + "'s voice and tone.
-
-"
-    header += "---
-
-"
-    body = "
-
-".join(phil_chunks)
+    header  = "# " + HOST_NAME + " Voice Corpus: " + episode_title + "\n\n"
+    header += "## About This Document\n\n"
+    header += ("This document contains only " + HOST_NAME + "'s spoken words from this "
+               "episode, cleaned into flowing paragraphs without timestamps or guest "
+               "dialogue. It is used to train Claude to write in " + HOST_NAME +
+               "'s voice and tone.\n\n")
+    header += "---\n\n"
+    body = "\n\n".join(phil_chunks)
     return header + body
 
 
 # -- Content generation --
-#  Content generation 
 def generate_content(piece_name, transcript, episode_title):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     fn = PROMPTS.get(piece_name)
