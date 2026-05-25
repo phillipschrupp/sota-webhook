@@ -540,61 +540,79 @@ def create_google_doc(title, content, folder, master_folder=None):
 def run_podcast_pipeline(episode_title, audio_url):
     episode_title = clean(episode_title)
     log.info("Podcast pipeline start - '%s'", episode_title)
-    safe_title  = episode_title[:60].strip()
-    results     = {"episode": episode_title, "docs": [], "errors": []}
+    safe_title      = episode_title[:60].strip()
+    results         = {"episode": episode_title, "docs": [], "errors": []}
+    audio_path      = None
+    compressed_path = None
 
-    # Download audio (needed for voice ID even though AssemblyAI gets the URL)
-    audio_path = None
     try:
-        audio_data = download_audio(audio_url)
-        audio_path = save_audio_temp(audio_data, audio_url)
+        # Download audio
+        audio_data  = download_audio(audio_url)
+        audio_path  = save_audio_temp(audio_data, audio_url)
 
-        # Compress if needed for local voice ID processing
+        # Compress if over Whisper 25MB limit
         if len(audio_data) > WHISPER_LIMIT:
-            log.info("Compressing for voice ID processing...")
-            compressed = compress_audio(audio_path)
-            process_path = compressed
+            log.info("Compressing audio...")
+            compressed_path = compress_audio(audio_path)
+            process_path = compressed_path
         else:
             process_path = audio_path
 
-        # Transcribe via AssemblyAI
-        plain, utterances, speaker_labels = transcribe_assemblyai(audio_url, process_path)
+        # Transcribe with Whisper
+        plain, segments = transcribe_whisper(process_path)
         plain = clean(plain)
 
-        # Identify Phil's voice
-        host_label = identify_host_speaker(process_path, speaker_labels, utterances)
+        # Identify which segments are Phil using resemblyzer
+        is_host = identify_host_segments(process_path, segments)
 
-        # Build formatted transcript with real names
-        formatted = clean(build_formatted_transcript(utterances, host_label))
+        # Build full formatted transcript (Phil + Guest labeled)
+        formatted = clean(build_formatted_transcript(segments, is_host))
+
+        # Build Phil-only corpus (flowing paragraphs, no timestamps)
+        corpus = build_phil_corpus(segments, is_host, episode_title)
+        if corpus:
+            corpus = clean(corpus)
 
     except Exception as e:
-        log.error("Transcription/voice ID failed: %s", e)
-        results["errors"].append("Transcription: " + str(e))
+        log.error("Audio processing failed: %s", e)
+        results["errors"].append("Audio processing: " + str(e))
         return results
     finally:
         if audio_path and os.path.exists(audio_path):
             os.unlink(audio_path)
+        if compressed_path and os.path.exists(compressed_path):
+            os.unlink(compressed_path)
 
-    # 1. Save raw transcript
+    # 1. Full transcript doc
     transcript_title = "[SOTA] Transcript - " + safe_title
-    header  = "# " + episode_title + "\n\n"
-    header += "## Full Episode Transcript\n\n"
-    header += "Speaker identification by voice matching.\n\n"
-    header += "---\n\n"
-    ok = create_google_doc(transcript_title, header + formatted, safe_title,
-                           master_folder=PODCAST_FOLDER)
+    t_header  = "# " + episode_title + "\n\n"
+    t_header += "## Full Episode Transcript\n\n"
+    t_header += "Speaker labels by resemblyzer voice matching.\n\n"
+    t_header += "---\n\n"
+    ok = create_google_doc(transcript_title, t_header + formatted,
+                           safe_title, master_folder=PODCAST_FOLDER)
     if ok:
         results["docs"].append(transcript_title)
     else:
         results["errors"].append("Transcript: doc creation failed")
 
-    # 2-5. Generate content pieces
+    # 2. Phil voice corpus doc
+    if corpus:
+        corpus_title = "[SOTA] " + HOST_NAME + " Voice Corpus - " + safe_title
+        ok = create_google_doc(corpus_title, corpus,
+                               safe_title, master_folder=PODCAST_FOLDER)
+        if ok:
+            results["docs"].append(corpus_title)
+        else:
+            results["errors"].append("Voice corpus: doc creation failed")
+
+    # 3-6. Content pieces
     for piece_key, piece_label in PODCAST_PIECES:
         try:
-            content   = clean(generate_content(piece_key, plain, episode_title))
-            doc_title = "[SOTA] " + piece_label + " - " + safe_title
-            ok        = create_google_doc(doc_title, content, safe_title,
-                                          master_folder=PODCAST_FOLDER)
+            piece_content = clean(generate_content(piece_key, plain, episode_title))
+            doc_title     = "[SOTA] " + piece_label + " - " + safe_title
+            ok = create_google_doc(doc_title, piece_content,
+                                   safe_title, master_folder=PODCAST_FOLDER)
             if ok:
                 results["docs"].append(doc_title)
             else:
