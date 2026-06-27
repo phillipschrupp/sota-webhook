@@ -699,21 +699,6 @@ def run_podcast_pipeline(episode_title, audio_url):
         else:
             results["errors"].append("Voice corpus: doc creation failed")
 
-    # 3-6. Content pieces
-    for piece_key, piece_label in PODCAST_PIECES:
-        try:
-            piece_content = clean(generate_content(piece_key, plain, episode_title))
-            doc_title     = "[SOTA] " + piece_label + " - " + safe_title
-            ok = create_google_doc(doc_title, piece_content,
-                                   safe_title, master_folder=PODCAST_FOLDER)
-            if ok:
-                results["docs"].append(doc_title)
-            else:
-                results["errors"].append(piece_label + ": doc creation failed")
-        except Exception as e:
-            log.error("Error on %s: %s", piece_key, e)
-            results["errors"].append(piece_label + ": " + str(e))
-
     log.info("Podcast pipeline done - %d docs, %d errors",
              len(results["docs"]), len(results["errors"]))
     return results
