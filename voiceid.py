@@ -74,13 +74,39 @@ class Voiceprints:
 
 
 def decode_audio(audio_path):
-    """Decode any audio file once to float32 mono 16 kHz with ffmpeg."""
-    cmd = ["ffmpeg", "-v", "error", "-i", audio_path, "-ac", "1", "-ar", str(SR),
-           "-f", "s16le", "-acodec", "pcm_s16le", "-"]
-    out = subprocess.run(cmd, capture_output=True, timeout=600)
+    """Decode any audio file once to int16 mono 16 kHz with ffmpeg, into a temp file
+    that is memory-mapped. Keeping the full signal as float32 in RAM (and the ffmpeg
+    stdout buffer beside it) peaked at ~500 MB for a 90-minute seminar, which is
+    what killed the Render instance mid-backfill. The memmap is paged by the OS;
+    only the slice being embedded is converted to float32."""
+    import tempfile
+    raw = tempfile.NamedTemporaryFile(suffix=".s16", delete=False)
+    raw.close()
+    cmd = ["ffmpeg", "-v", "error", "-y", "-i", audio_path, "-ac", "1", "-ar", str(SR),
+           "-f", "s16le", "-acodec", "pcm_s16le", raw.name]
+    out = subprocess.run(cmd, capture_output=True, timeout=900)
     if out.returncode != 0:
+        os.unlink(raw.name)
         raise RuntimeError("ffmpeg decode failed: " + out.stderr.decode("ascii", "ignore")[:200])
-    return np.frombuffer(out.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    if os.path.getsize(raw.name) < 2:
+        os.unlink(raw.name)
+        raise RuntimeError("ffmpeg produced no audio")
+    audio = np.memmap(raw.name, dtype=np.int16, mode="r")
+    audio._voiceid_tmp = raw.name          # released in label_segments
+    return audio
+
+
+def _release_audio(audio):
+    path = getattr(audio, "_voiceid_tmp", None)
+    try:
+        del audio
+    except Exception:
+        pass
+    if path and os.path.exists(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def _embed_all(audio, segments):
@@ -94,7 +120,8 @@ def _embed_all(audio, segments):
         a, b  = int(start * SR), int((start + dur) * SR)
         if dur < MIN_SEG or b <= a or a >= len(audio):
             embs.append(None); continue
-        wav = preprocess_wav(audio[a:b], source_sr=SR)
+        chunk = np.asarray(audio[a:b], dtype=np.float32) / 32768.0
+        wav = preprocess_wav(chunk, source_sr=SR)
         if len(wav) < int(0.6 * SR):
             embs.append(None); continue
         e = encoder.embed_utterance(wav)
@@ -228,7 +255,10 @@ def label_segments(audio_path, segments, vp):
     label is a speaker name | "Guest N" | "Unknown" | "Unsure" | None (too short to embed).
     """
     audio = decode_audio(audio_path)
-    embs  = _embed_all(audio, segments)
+    try:
+        embs = _embed_all(audio, segments)
+    finally:
+        _release_audio(audio)
     out   = [dict(label=None, top=0.0, margin=0.0, nearest=None, smoothed=False) for _ in segments]
 
     # pass 1: global voiceprints

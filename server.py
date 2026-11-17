@@ -358,7 +358,16 @@ def fetch_feed(feed_url=None):
 
 
 def _norm_title(t):
-    return "".join(ch for ch in clean(t).lower() if ch.isalnum() or ch == " ").strip()
+    """Lowercase, every non-alphanumeric run (punctuation, em dashes, curly quotes, non-ASCII)
+    becomes a single space. 'Runs Out\u2014and' and 'Runs Out and' normalize the same."""
+    t = t.lower()
+    out, prev_space = [], True
+    for ch in t:
+        if ch.isascii() and ch.isalnum():
+            out.append(ch); prev_space = False
+        elif not prev_space:
+            out.append(" "); prev_space = True
+    return "".join(out).strip()
 
 
 def find_feed_item(title=None, audio_url=None, items=None):
@@ -554,9 +563,15 @@ def create_google_doc(title, content, folder, master_folder=None):
 
 
 #  Podcast pipeline
-def run_podcast_pipeline(episode_title, audio_url, transcript_url=None):
+ALL_DOCS = ("transcript", "corpus", "report")
+
+
+def run_podcast_pipeline(episode_title, audio_url, transcript_url=None, docs=None):
+    """docs: subset of ALL_DOCS to write (default all). Use ["transcript"] to regenerate
+    only the Transcript doc for an episode whose other docs already exist."""
+    docs = tuple(d for d in (docs or ALL_DOCS) if d in ALL_DOCS) or ALL_DOCS
     episode_title = clean(episode_title)
-    log.info("Podcast pipeline start - '%s'", episode_title)
+    log.info("Podcast pipeline start - '%s' (docs: %s)", episode_title, ", ".join(docs))
     safe_title      = episode_title[:60].strip()
     results         = {"episode": episode_title, "docs": [], "errors": []}
     audio_path      = None
@@ -566,6 +581,8 @@ def run_podcast_pipeline(episode_title, audio_url, transcript_url=None):
         # Audio (original quality is what voiceid listens to)
         audio_data = download_audio(audio_url)
         audio_path = save_audio_temp(audio_data, audio_url)
+        audio_bytes = len(audio_data)
+        del audio_data                      # keep memory headroom for the voice encoder
 
         # Transcript: feed SRT when we have one, else Whisper
         segments, source = None, None
@@ -577,7 +594,7 @@ def run_podcast_pipeline(episode_title, audio_url, transcript_url=None):
                 log.warning("Feed transcript unavailable (%s) - falling back to Whisper", e)
         if segments is None:
             process_path = audio_path
-            if len(audio_data) > WHISPER_LIMIT:
+            if audio_bytes > WHISPER_LIMIT:
                 log.info("Compressing audio for Whisper...")
                 compressed_path = compress_audio(audio_path)
                 process_path = compressed_path
@@ -612,27 +629,32 @@ def run_podcast_pipeline(episode_title, audio_url, transcript_url=None):
     t_header += ("Transcript: " + source + ". Speaker labels by voiceprint matching (voiceid, voiceprints v"
                  + vp_version + "). Unknown = voice not enrolled. Unsure = too close to call.\n\n")
     t_header += "---\n\n"
-    if create_google_doc(transcript_title, t_header + formatted, safe_title, master_folder=PODCAST_FOLDER):
-        results["docs"].append(transcript_title)
-    else:
-        results["errors"].append("Transcript: doc creation failed")
+    if "transcript" in docs:
+        if create_google_doc(transcript_title, t_header + formatted, safe_title, master_folder=PODCAST_FOLDER):
+            results["docs"].append(transcript_title)
+        else:
+            results["errors"].append("Transcript: doc creation failed")
 
     # 2. Phil voice corpus doc
-    if corpus:
-        corpus_title = "[SOTA] " + HOST_NAME + " Voice Corpus - " + safe_title
-        if create_google_doc(corpus_title, corpus, safe_title, master_folder=PODCAST_FOLDER):
-            results["docs"].append(corpus_title)
+    if "corpus" in docs:
+        if corpus:
+            corpus_title = "[SOTA] " + HOST_NAME + " Voice Corpus - " + safe_title
+            if create_google_doc(corpus_title, corpus, safe_title, master_folder=PODCAST_FOLDER):
+                results["docs"].append(corpus_title)
+            else:
+                results["errors"].append("Voice corpus: doc creation failed")
         else:
-            results["errors"].append("Voice corpus: doc creation failed")
-    else:
-        results["errors"].append("Voice corpus: no confident " + HOST_NAME + " segments")
+            # Not an error: Sean-solo or guest-only episode. Report still shows who spoke.
+            results.setdefault("notes", []).append(
+                "No " + HOST_NAME + " speech detected; voice corpus skipped")
 
     # 3. Attribution report
-    report_title = "[SOTA] Attribution Report - " + safe_title
-    if create_google_doc(report_title, report, safe_title, master_folder=PODCAST_FOLDER):
-        results["docs"].append(report_title)
-    else:
-        results["errors"].append("Attribution report: doc creation failed")
+    if "report" in docs:
+        report_title = "[SOTA] Attribution Report - " + safe_title
+        if create_google_doc(report_title, report, safe_title, master_folder=PODCAST_FOLDER):
+            results["docs"].append(report_title)
+        else:
+            results["errors"].append("Attribution report: doc creation failed")
 
     log.info("Podcast pipeline done - %d docs, %d errors", len(results["docs"]), len(results["errors"]))
     return results
@@ -642,16 +664,17 @@ def run_podcast_pipeline(episode_title, audio_url, transcript_url=None):
 BACKFILL = {"running": False, "started": None, "finished": None, "plan": [], "done": [], "errors": [], "current": None}
 
 
-def run_backfill(items, delay_seconds):
+def run_backfill(items, delay_seconds, docs=None):
     BACKFILL.update(running=True, started=datetime.datetime.utcnow().isoformat(), finished=None,
-                    done=[], errors=[], current=None)
+                    done=[], errors=[], current=None, docs=list(docs or ALL_DOCS))
     try:
         for it in items:
             BACKFILL["current"] = it["title"]
             log.info("Backfill: %s", it["title"])
             try:
-                res = run_podcast_pipeline(it["title"], it["audio_url"], it.get("transcript_url"))
-                BACKFILL["done"].append({"title": it["title"], "docs": len(res["docs"]), "errors": res["errors"]})
+                res = run_podcast_pipeline(it["title"], it["audio_url"], it.get("transcript_url"), docs=docs)
+                BACKFILL["done"].append({"title": it["title"], "docs": len(res["docs"]),
+                                         "errors": res["errors"], "notes": res.get("notes", [])})
             except Exception as e:
                 log.error("Backfill failed for '%s': %s", it["title"], e)
                 BACKFILL["errors"].append({"title": it["title"], "error": str(e)})
@@ -939,7 +962,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self.send_json(200, {"status": "ok", "service": "SOTA Content Automation v4",
+            self.send_json(200, {"status": "ok", "service": "SOTA Content Automation v4.1",
                                  "voiceprints": VOICEPRINTS.describe() if VOICEPRINTS else None})
         elif self.path == "/backfill/status":
             self.send_json(200, BACKFILL)
@@ -981,7 +1004,7 @@ class Handler(BaseHTTPRequestHandler):
                     if item and item.get("transcript_url"):
                         tr = item["transcript_url"]
                         log.info("Found feed transcript for '%s'", title)
-                run_podcast_pipeline(title, audio_url, tr)
+                run_podcast_pipeline(title, audio_url, tr, docs=payload.get("docs"))
 
             threading.Thread(target=episode_job, daemon=True).start()
 
@@ -1002,8 +1025,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, {"status": "dry_run", "count": len(plan), "plan": plan})
                 return
             delay = float(payload.get("delay_seconds", 30))
-            self.send_json(202, {"status": "accepted", "count": len(plan), "plan": plan})
-            threading.Thread(target=run_backfill, args=(items, delay), daemon=True).start()
+            docs  = payload.get("docs")        # e.g. ["transcript"] to regenerate transcripts only
+            self.send_json(202, {"status": "accepted", "count": len(plan), "plan": plan, "docs": docs or list(ALL_DOCS)})
+            threading.Thread(target=run_backfill, args=(items, delay, docs), daemon=True).start()
 
         #  Discovery call 
         elif self.path == "/discovery":
@@ -1041,7 +1065,7 @@ if __name__ == "__main__":
         log.error("Could not load voiceprints from %s: %s", VOICEPRINTS_PATH, e)
 
     server = HTTPServer(("0.0.0.0", PORT), Handler)
-    log.info("SOTA Content Automation v4 running on port %d", PORT)
+    log.info("SOTA Content Automation v4.1 running on port %d", PORT)
     log.info("Endpoints: POST /episode | POST /backfill | POST /discovery")
     log.info("Health:    GET  /health | GET /backfill/status")
     try:
