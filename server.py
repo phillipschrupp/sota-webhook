@@ -411,15 +411,18 @@ def transcribe_whisper(audio_path):
 
 # -- Speaker attribution --
 def attribute_speakers(audio_path, segments):
-    """Label every segment with voiceid. Never guesses: without voiceprints everything is Unsure."""
+    """Label every segment with voiceid. Never guesses: on any failure everything is Unsure
+    and the failure reason is returned so it lands in the Attribution Report, not just the log."""
     if VOICEPRINTS is None:
-        log.error("No voiceprints loaded - all segments marked Unsure. Check VOICEPRINTS_PATH.")
-        return voiceid.all_unsure(segments)
+        msg = "No voiceprints loaded - check VOICEPRINTS_PATH"
+        log.error(msg)
+        return voiceid.all_unsure(segments), msg
     try:
-        return voiceid.label_segments(audio_path, segments, VOICEPRINTS)
+        return voiceid.label_segments(audio_path, segments, VOICEPRINTS), None
     except Exception as e:
-        log.error("voiceid failed (%s) - all segments marked Unsure", e)
-        return voiceid.all_unsure(segments)
+        msg = "%s: %s" % (type(e).__name__, str(e)[:400])
+        log.error("voiceid failed (%s) - all segments marked Unsure", msg, exc_info=True)
+        return voiceid.all_unsure(segments), msg
 
 
 def _fmt_ts(seconds):
@@ -471,7 +474,7 @@ def build_phil_corpus(segments, labels, episode_title):
     return header + "\n\n".join(chunks)
 
 
-def build_attribution_report(segments, labels, episode_title, source):
+def build_attribution_report(segments, labels, episode_title, source, failure=None):
     """Talk time per speaker, confidence summary, and 20 Phil lines to spot-check."""
     tt = voiceid.talk_time(segments, labels)
     total = sum(tt.values()) or 1.0
@@ -480,6 +483,9 @@ def build_attribution_report(segments, labels, episode_title, source):
     out  = "# Attribution Report: " + episode_title + "\n\n"
     out += "Transcript source: " + source + "\n"
     out += "Speaker attribution: " + vp_desc + "\n"
+    if failure:
+        out += ("\n**ATTRIBUTION DID NOT RUN.** Every segment is Unsure because the speaker-ID step failed, "
+                "not because the audio was hard to match. Error: " + failure + "\n")
     out += ("Rule: long segments need similarity >= %.2f and margin >= %.2f; short segments must agree "
             "with a confident neighbor; Unknown = not an enrolled voice; Unsure = too close to call.\n\n"
             % (voiceid.SIM_FLOOR, voiceid.MARGIN))
@@ -570,12 +576,14 @@ def run_podcast_pipeline(episode_title, audio_url, transcript_url=None):
             source = "OpenAI Whisper"
 
         # Who said what
-        labels = attribute_speakers(audio_path, segments)
+        labels, attr_failure = attribute_speakers(audio_path, segments)
+        if attr_failure:
+            results["errors"].append("Speaker attribution: " + attr_failure)
 
         formatted = clean(build_formatted_transcript(segments, labels))
         corpus    = build_phil_corpus(segments, labels, episode_title)
         corpus    = clean(corpus) if corpus else None
-        report    = clean(build_attribution_report(segments, labels, episode_title, source))
+        report    = clean(build_attribution_report(segments, labels, episode_title, source, attr_failure))
 
     except Exception as e:
         log.error("Audio processing failed: %s", e)
