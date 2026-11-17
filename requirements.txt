@@ -2,3 +2,4 @@ anthropic>=0.25.0
 openai>=1.0.0
 resemblyzer>=0.1.1
 numpy>=1.24.0
+setuptools>=68,<81   # resemblyzer imports pkg_resources; newer Pythons do not ship it, and setuptools 81+ may drop it

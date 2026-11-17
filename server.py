@@ -534,14 +534,23 @@ def create_google_doc(title, content, folder, master_folder=None):
     ).encode("utf-8")
     req = Request(GOOGLE_SCRIPT_URL, data=payload,
                   headers={"Content-Type": "application/json; charset=utf-8"})
-    try:
-        with urlopen(req, timeout=20) as resp:
-            resp.read()
-        log.info("Doc created: %s", title)
-        return True
-    except Exception as e:
-        log.error("Doc creation failed for '%s': %s", title, e)
-        return False
+    # Apps Script builds the doc line by line; a 950-line transcript can take well over
+    # 20 seconds. Long timeout, and retry once only when the request never reached the
+    # script (a timeout may mean the doc was created anyway, so never retry those).
+    for attempt in (1, 2):
+        try:
+            with urlopen(req, timeout=180) as resp:
+                resp.read()
+            log.info("Doc created: %s", title)
+            return True
+        except Exception as e:
+            timed_out = isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError)
+            if timed_out or attempt == 2:
+                log.error("Doc creation failed for '%s': %s", title, e)
+                return False
+            log.warning("Doc creation attempt %d failed for '%s' (%s) - retrying", attempt, title, e)
+            time.sleep(5)
+    return False
 
 
 #  Podcast pipeline
