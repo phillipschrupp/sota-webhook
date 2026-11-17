@@ -1,15 +1,18 @@
 """
-SOTA Content Automation - Webhook Server v3
+SOTA Content Automation - Webhook Server v4
 ===========================================
 Two independent pipelines:
 
 1. POST /episode  - Podcast episodes (Spotify RSS via Zapier)
    - Downloads audio
-   - Whisper transcription (OpenAI)
-   - resemblyzer voice matching against Phil voice reference clip
-     (downloaded from Google Drive on startup)
-   - Extracts Phil-only lines into a voice corpus doc
-   - Generates 5 content pieces + raw transcript in Google Drive
+   - Transcript: Spotify's SRT from the RSS feed when available, else Whisper (OpenAI)
+   - Speaker attribution with enrolled voiceprints (voiceid.py, voiceprints.json):
+     Phil / Sean / Rowen / Guest N / Unknown / Unsure
+   - Writes three docs to Google Drive: full transcript, Phil-only voice corpus,
+     attribution report (talk time + 20 lines to spot-check)
+
+   POST /backfill - Walk the RSS feed and run /episode for every episode not yet done
+   GET  /backfill/status
 
 2. POST /discovery - Discovery calls (Zoom VTT/SRT via Zapier)
    - Parses Zoom transcript (speaker names already embedded)
@@ -20,14 +23,18 @@ Deploy on Render:
   Start command: python server.py
   Env vars: ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_SCRIPT_URL,
             WEBHOOK_SECRET, HOST_NAME (default: Phil),
-            VOICE_REF_GDRIVE_ID (Google Drive file ID of phil_voice.wav)
+            FEED_URL (podcast RSS; used to find Spotify transcripts and for /backfill),
+            VOICEPRINTS_PATH (default: voiceprints.json next to this file)
+  Removed in v4: VOICE_REF_GDRIVE_ID (single reference clip). See README.md.
 """
 
 import os, json, hashlib, hmac, tempfile, threading, logging, subprocess, time, datetime
+import xml.etree.ElementTree as ET
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import Request, urlopen
 import anthropic
 import openai
+import voiceid
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("sota")
@@ -40,11 +47,10 @@ WEBHOOK_SECRET      = os.environ.get("WEBHOOK_SECRET", "")
 PORT                = int(os.environ.get("PORT", 8080))
 HOST_NAME           = os.environ.get("HOST_NAME", "Phil")
 WHISPER_LIMIT       = 24 * 1024 * 1024
-
-# Google Drive file ID from the share link of phil_voice.wav
-# Share link: https://drive.google.com/file/d/FILE_ID/view -> use FILE_ID
-VOICE_REF_GDRIVE_ID = os.environ.get("VOICE_REF_GDRIVE_ID", "")
-VOICE_REF_PATH      = "/tmp/phil_voice_ref.wav"
+FEED_URL            = os.environ.get("FEED_URL", "https://anchor.fm/s/ff847b50/podcast/rss")
+VOICEPRINTS_PATH    = os.environ.get("VOICEPRINTS_PATH",
+                                     os.path.join(os.path.dirname(os.path.abspath(__file__)), "voiceprints.json"))
+VOICEPRINTS         = None   # loaded at startup
 
 PODCAST_FOLDER      = "Podcast Transcripts"
 DISCOVERY_FOLDER    = "Discovery Calls"
@@ -315,125 +321,74 @@ def save_audio_temp(audio_data, audio_url):
         return tmp.name
 
 
-#  Voice identification with resemblyzer 
-def identify_host_speaker(audio_path, speaker_labels, utterances):
+#  Feed + transcript sources
+def fetch_text(url, timeout=60):
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; SOTA-Bot/1.0)"})
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "ignore")
+
+
+def fetch_feed(feed_url=None):
     """
-    Use resemblyzer to compare each speaker's audio segments against
-    Phil's reference voice clip. Returns the speaker label that best
-    matches Phil's voice.
-    Falls back to first-speaker heuristic if resemblyzer unavailable
-    or reference clip not found.
+    Parse the podcast RSS. Returns a list (newest first) of dicts:
+    title, pub_date (RFC 2822 string), audio_url, transcript_url (Spotify SRT or None), duration.
     """
-    # Check prerequisites
-    if not os.path.exists(VOICE_REF_PATH):
-        log.warning("Voice reference clip not found at %s - using first-speaker fallback", VOICE_REF_PATH)
-        return _first_speaker_fallback(utterances)
+    xml_text = fetch_text(feed_url or FEED_URL, timeout=60)
+    root = ET.fromstring(xml_text)
+    ns = {"podcast": "https://podcastindex.org/namespace/1.0",
+          "itunes":  "http://www.itunes.com/dtds/podcast-1.0.dtd"}
+    items = []
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        enc   = it.find("enclosure")
+        audio = enc.get("url") if enc is not None else None
+        tr    = None
+        for t in it.findall("podcast:transcript", ns):
+            typ = (t.get("type") or "").lower()
+            if "subrip" in typ or t.get("url", "").endswith(".srt"):
+                tr = t.get("url"); break
+        if tr is None:
+            t = it.find("podcast:transcript", ns)
+            tr = t.get("url") if t is not None else None
+        items.append(dict(title=title, pub_date=(it.findtext("pubDate") or "").strip(),
+                          audio_url=audio, transcript_url=tr,
+                          duration=(it.findtext("itunes:duration", default="", namespaces=ns) or "").strip()))
+    log.info("Feed: %d items", len(items))
+    return items
 
+
+def _norm_title(t):
+    return "".join(ch for ch in clean(t).lower() if ch.isalnum() or ch == " ").strip()
+
+
+def find_feed_item(title=None, audio_url=None, items=None):
+    """Match an episode in the feed by audio URL (exact) or title (normalized, prefix-tolerant)."""
     try:
-        from resemblyzer import VoiceEncoder, preprocess_wav
-        from pathlib import Path
-        import numpy as np
-
-        log.info("Loading resemblyzer encoder...")
-        encoder = VoiceEncoder()
-
-        # Embed Phil's reference voice
-        ref_wav = preprocess_wav(Path(VOICE_REF_PATH))
-        ref_embed = encoder.embed_utterance(ref_wav)
-        log.info("Reference voice embedded.")
-
-        # For each speaker, extract a sample segment and embed it
-        # We use the longest utterance per speaker for best accuracy
-        best_match   = None
-        best_score   = -1.0
-
-        for label in speaker_labels:
-            # Find the longest utterance for this speaker
-            speaker_utts = [u for u in utterances if u.get("speaker") == label]
-            if not speaker_utts:
-                continue
-
-            longest = max(speaker_utts, key=lambda u: u.get("end", 0) - u.get("start", 0))
-            start_ms = longest.get("start", 0)
-            end_ms   = longest.get("end", start_ms + 10000)
-
-            # Extract that segment with ffmpeg
-            seg_path = audio_path + "_spk_" + label + ".wav"
-            start_s  = start_ms / 1000.0
-            dur_s    = min((end_ms - start_ms) / 1000.0, 30.0)  # cap at 30s
-
-            cmd = [
-                "ffmpeg", "-y", "-i", audio_path,
-                "-ss", str(start_s), "-t", str(dur_s),
-                "-ac", "1", "-ar", "16000",
-                seg_path
-            ]
-            result = subprocess.run(cmd, capture_output=True, timeout=60)
-            if result.returncode != 0:
-                log.warning("ffmpeg segment extract failed for speaker %s", label)
-                continue
-
-            try:
-                seg_wav   = preprocess_wav(Path(seg_path))
-                seg_embed = encoder.embed_utterance(seg_wav)
-                # Cosine similarity
-                score = float(np.dot(ref_embed, seg_embed) /
-                              (np.linalg.norm(ref_embed) * np.linalg.norm(seg_embed)))
-                log.info("Speaker %s similarity to Phil: %.3f", label, score)
-                if score > best_score:
-                    best_score = score
-                    best_match = label
-            finally:
-                if os.path.exists(seg_path):
-                    os.unlink(seg_path)
-
-        if best_match and best_score > 0.75:
-            log.info("Voice match: %s identified as %s (score: %.3f)", best_match, HOST_NAME, best_score)
-            return best_match
-        else:
-            log.warning("No confident voice match (best: %.3f) - using first-speaker fallback", best_score)
-            return _first_speaker_fallback(utterances)
-
-    except ImportError:
-        log.warning("resemblyzer not installed - using first-speaker fallback")
-        return _first_speaker_fallback(utterances)
+        items = items or fetch_feed()
     except Exception as e:
-        log.warning("Voice identification failed (%s) - using first-speaker fallback", e)
-        return _first_speaker_fallback(utterances)
+        log.warning("Feed lookup failed: %s", e)
+        return None
+    if audio_url:
+        for it in items:
+            if it["audio_url"] and it["audio_url"].split("?")[0] == audio_url.split("?")[0]:
+                return it
+    if title:
+        nt = _norm_title(title)
+        for it in items:
+            ni = _norm_title(it["title"])
+            if ni == nt or ni.startswith(nt[:40]) or nt.startswith(ni[:40]):
+                return it
+    return None
 
 
-def _first_speaker_fallback(utterances):
-    """Return the speaker label that appears first in the transcript."""
-    if not utterances:
-        return "A"
-    first = min(utterances, key=lambda u: u.get("start", 0))
-    label = first.get("speaker", "A")
-    log.info("First-speaker fallback: %s -> %s", label, HOST_NAME)
-    return label
-
-
-# -- Startup: download Phil voice reference from Google Drive --
-def download_voice_reference():
-    """Download Phil voice reference clip from Google Drive on server startup."""
-    if not VOICE_REF_GDRIVE_ID:
-        log.warning("VOICE_REF_GDRIVE_ID not set - voice matching unavailable")
-        return False
-    if os.path.exists(VOICE_REF_PATH):
-        log.info("Voice reference already cached at %s", VOICE_REF_PATH)
-        return True
-    try:
-        url = "https://drive.google.com/uc?export=download&id=" + VOICE_REF_GDRIVE_ID
-        log.info("Downloading voice reference from Google Drive...")
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urlopen(req, timeout=30) as resp:
-            data = resp.read()
-        with open(VOICE_REF_PATH, "wb") as f:
-            f.write(data)
-        log.info("Voice reference saved: %d bytes", len(data))
-        return True
-    except Exception as e:
-        log.error("Failed to download voice reference: %s", e)
-        return False
+def load_srt_segments(transcript_url):
+    """Spotify's machine transcript for the episode, as timed segments."""
+    text = fetch_text(transcript_url, timeout=60)
+    segs = voiceid.parse_srt_segments(text)
+    if len(segs) < 20:
+        raise RuntimeError("transcript too short (%d cues)" % len(segs))
+    log.info("Loaded %d cues from feed transcript", len(segs))
+    return segs
 
 
 # -- Whisper transcription --
@@ -454,144 +409,98 @@ def transcribe_whisper(audio_path):
     return plain, segments
 
 
-# -- Voice identification with resemblyzer --
-def identify_host_segments(audio_path, segments):
-    """
-    Use resemblyzer to compare each Whisper segment against Phil voice reference.
-    Returns a list of booleans: True = this segment is Phil speaking.
-    Falls back to first-speaker heuristic if resemblyzer unavailable.
-    """
-    if not os.path.exists(VOICE_REF_PATH):
-        log.warning("Voice reference not found - using first-speaker fallback")
-        return _first_speaker_fallback_segments(segments)
-
+# -- Speaker attribution --
+def attribute_speakers(audio_path, segments):
+    """Label every segment with voiceid. Never guesses: without voiceprints everything is Unsure."""
+    if VOICEPRINTS is None:
+        log.error("No voiceprints loaded - all segments marked Unsure. Check VOICEPRINTS_PATH.")
+        return voiceid.all_unsure(segments)
     try:
-        from resemblyzer import VoiceEncoder, preprocess_wav
-        from pathlib import Path
-        import numpy as np
-
-        log.info("Loading resemblyzer encoder...")
-        encoder   = VoiceEncoder()
-        ref_wav   = preprocess_wav(Path(VOICE_REF_PATH))
-        ref_embed = encoder.embed_utterance(ref_wav)
-        log.info("Reference voice embedded.")
-
-        is_host = []
-        for seg in segments:
-            start_s = seg.start
-            dur_s   = min(seg.end - seg.start, 20.0)
-            if dur_s < 1.0:
-                is_host.append(None)
-                continue
-
-            seg_path = audio_path + "_seg.wav"
-            cmd = ["ffmpeg", "-y", "-i", audio_path,
-                   "-ss", str(start_s), "-t", str(dur_s),
-                   "-ac", "1", "-ar", "16000", seg_path]
-            result = subprocess.run(cmd, capture_output=True, timeout=30)
-            if result.returncode != 0:
-                is_host.append(None)
-                continue
-
-            try:
-                seg_wav   = preprocess_wav(Path(seg_path))
-                seg_embed = encoder.embed_utterance(seg_wav)
-                score = float(np.dot(ref_embed, seg_embed) /
-                              (np.linalg.norm(ref_embed) * np.linalg.norm(seg_embed)))
-                is_host.append(score > 0.72)
-            except Exception:
-                is_host.append(None)
-            finally:
-                if os.path.exists(seg_path):
-                    os.unlink(seg_path)
-
-        host_count  = sum(1 for v in is_host if v is True)
-        guest_count = sum(1 for v in is_host if v is False)
-        log.info("Voice ID complete: %d host segments, %d guest segments, %d unclear",
-                 host_count, guest_count, sum(1 for v in is_host if v is None))
-        return is_host
-
-    except ImportError:
-        log.warning("resemblyzer not installed - using first-speaker fallback")
-        return _first_speaker_fallback_segments(segments)
+        return voiceid.label_segments(audio_path, segments, VOICEPRINTS)
     except Exception as e:
-        log.warning("Voice ID failed (%s) - using first-speaker fallback", e)
-        return _first_speaker_fallback_segments(segments)
+        log.error("voiceid failed (%s) - all segments marked Unsure", e)
+        return voiceid.all_unsure(segments)
 
 
-def _first_speaker_fallback_segments(segments):
-    """
-    Fallback: alternate host/guest based on natural pause gaps.
-    First speaker = Phil. Speaker changes on pauses > 1.5s.
-    """
-    if not segments:
-        return []
-    is_host     = []
-    current     = True
-    prev_end    = 0.0
-    PAUSE_THRESH = 1.5
-    for seg in segments:
-        if seg.start - prev_end > PAUSE_THRESH and prev_end > 0:
-            current = not current
-        is_host.append(current)
-        prev_end = seg.end
-    return is_host
+def _fmt_ts(seconds):
+    return "[%02d:%02d]" % (int(seconds // 60), int(seconds % 60))
 
 
-def build_formatted_transcript(segments, is_host):
-    """Build full formatted transcript with Phil / Guest labels and timestamps."""
+def build_formatted_transcript(segments, labels):
+    """Full transcript with speaker names and timestamps."""
     lines = []
-    for seg, host in zip(segments, is_host):
+    for seg, r in zip(segments, labels):
         text = seg.text.strip()
         if not text:
             continue
-        mins = int(seg.start // 60)
-        secs = int(seg.start % 60)
-        if host is True:
-            label = "**" + HOST_NAME + "** [%02d:%02d]" % (mins, secs)
-        elif host is False:
-            label = "**Guest** [%02d:%02d]" % (mins, secs)
+        lab = r["label"]
+        if lab is None:
+            lines.append(_fmt_ts(seg.start) + "\n" + text)
         else:
-            label = "[%02d:%02d]" % (mins, secs)
-        lines.append(label + "\n" + text)
+            lines.append("**" + lab + "** " + _fmt_ts(seg.start) + "\n" + text)
     return "\n\n".join(lines)
 
 
-def build_phil_corpus(segments, is_host, episode_title):
+def build_phil_corpus(segments, labels, episode_title):
     """
-    Extract only Phil's lines, clean them into flowing paragraphs.
-    Strips timestamps. Groups consecutive Phil segments into paragraphs.
-    This becomes the voice training corpus doc.
+    Only segments attributed to HOST_NAME with confidence, grouped into paragraphs
+    on consecutive segments. Unsure, Unknown, and guest segments break a paragraph
+    and never enter the corpus.
     """
-    phil_chunks   = []
-    current_chunk = []
-
-    for seg, host in zip(segments, is_host):
+    chunks, cur = [], []
+    for seg, r in zip(segments, labels):
         text = seg.text.strip()
         if not text:
             continue
-        if host is True:
-            current_chunk.append(text)
-        else:
-            if current_chunk:
-                phil_chunks.append(" ".join(current_chunk))
-                current_chunk = []
-
-    if current_chunk:
-        phil_chunks.append(" ".join(current_chunk))
-
-    if not phil_chunks:
+        if r["label"] == HOST_NAME:
+            cur.append(text)
+        elif cur:
+            chunks.append(" ".join(cur)); cur = []
+    if cur:
+        chunks.append(" ".join(cur))
+    chunks = [c for c in chunks if len(c.split()) >= 4]
+    if not chunks:
         return None
-
     header  = "# " + HOST_NAME + " Voice Corpus: " + episode_title + "\n\n"
     header += "## About This Document\n\n"
-    header += ("This document contains only " + HOST_NAME + "'s spoken words from this "
-               "episode, cleaned into flowing paragraphs without timestamps or guest "
-               "dialogue. It is used to train Claude to write in " + HOST_NAME +
-               "'s voice and tone.\n\n")
+    header += ("This document contains only " + HOST_NAME + "'s spoken words from this episode, "
+               "attributed by voiceprint matching with high confidence, cleaned into flowing "
+               "paragraphs without timestamps or other speakers. Wording is untouched. "
+               "It is used to train Claude to write in " + HOST_NAME + "'s voice and tone.\n\n")
     header += "---\n\n"
-    body = "\n\n".join(phil_chunks)
-    return header + body
+    return header + "\n\n".join(chunks)
+
+
+def build_attribution_report(segments, labels, episode_title, source):
+    """Talk time per speaker, confidence summary, and 20 Phil lines to spot-check."""
+    tt = voiceid.talk_time(segments, labels)
+    total = sum(tt.values()) or 1.0
+    order = sorted(tt.items(), key=lambda kv: -kv[1])
+    vp_desc = VOICEPRINTS.describe() if VOICEPRINTS else "no voiceprints loaded"
+    out  = "# Attribution Report: " + episode_title + "\n\n"
+    out += "Transcript source: " + source + "\n"
+    out += "Speaker attribution: " + vp_desc + "\n"
+    out += ("Rule: long segments need similarity >= %.2f and margin >= %.2f; short segments must agree "
+            "with a confident neighbor; Unknown = not an enrolled voice; Unsure = too close to call.\n\n"
+            % (voiceid.SIM_FLOOR, voiceid.MARGIN))
+    out += "## Talk time\n\n"
+    for lab, secs in order:
+        out += "%s: %d:%02d (%.0f%%)\n" % (lab, int(secs // 60), int(secs % 60), secs / total * 100)
+    n = len(segments)
+    conf = sum(1 for r in labels if r["label"] and r["label"] not in (voiceid.UNSURE, voiceid.UNKNOWN))
+    out += "\nSegments: %d total, %d labeled with a name (%.0f%%), %d Unsure, %d Unknown, %d too short to embed.\n" % (
+        n, conf, conf / max(n, 1) * 100,
+        sum(1 for r in labels if r["label"] == voiceid.UNSURE),
+        sum(1 for r in labels if r["label"] == voiceid.UNKNOWN),
+        sum(1 for r in labels if r["label"] is None))
+    phil = [(seg, r) for seg, r in zip(segments, labels) if r["label"] == HOST_NAME and len(seg.text.split()) >= 6]
+    step = max(1, len(phil) // 20)
+    sample = phil[::step][:20]
+    out += "\n## Spot check: lines attributed to " + HOST_NAME + "\n\n"
+    out += "Mark any line that is not " + HOST_NAME + ".\n\n"
+    for k, (seg, r) in enumerate(sample, 1):
+        out += "%d. %s %s\n" % (k, _fmt_ts(seg.start), seg.text.strip()[:160])
+    return out
 
 
 # -- Content generation --
@@ -629,8 +538,8 @@ def create_google_doc(title, content, folder, master_folder=None):
         return False
 
 
-#  Podcast pipeline 
-def run_podcast_pipeline(episode_title, audio_url):
+#  Podcast pipeline
+def run_podcast_pipeline(episode_title, audio_url, transcript_url=None):
     episode_title = clean(episode_title)
     log.info("Podcast pipeline start - '%s'", episode_title)
     safe_title      = episode_title[:60].strip()
@@ -639,52 +548,54 @@ def run_podcast_pipeline(episode_title, audio_url):
     compressed_path = None
 
     try:
-        # Download audio
-        audio_data  = download_audio(audio_url)
-        audio_path  = save_audio_temp(audio_data, audio_url)
+        # Audio (original quality is what voiceid listens to)
+        audio_data = download_audio(audio_url)
+        audio_path = save_audio_temp(audio_data, audio_url)
 
-        # Compress if over Whisper 25MB limit
-        if len(audio_data) > WHISPER_LIMIT:
-            log.info("Compressing audio...")
-            compressed_path = compress_audio(audio_path)
-            process_path = compressed_path
-        else:
+        # Transcript: feed SRT when we have one, else Whisper
+        segments, source = None, None
+        if transcript_url:
+            try:
+                segments = load_srt_segments(transcript_url)
+                source   = "Spotify transcript (SRT from RSS feed)"
+            except Exception as e:
+                log.warning("Feed transcript unavailable (%s) - falling back to Whisper", e)
+        if segments is None:
             process_path = audio_path
+            if len(audio_data) > WHISPER_LIMIT:
+                log.info("Compressing audio for Whisper...")
+                compressed_path = compress_audio(audio_path)
+                process_path = compressed_path
+            _, segments = transcribe_whisper(process_path)
+            source = "OpenAI Whisper"
 
-        # Transcribe with Whisper
-        plain, segments = transcribe_whisper(process_path)
-        plain = clean(plain)
+        # Who said what
+        labels = attribute_speakers(audio_path, segments)
 
-        # Identify which segments are Phil using resemblyzer
-        is_host = identify_host_segments(process_path, segments)
-
-        # Build full formatted transcript (Phil + Guest labeled)
-        formatted = clean(build_formatted_transcript(segments, is_host))
-
-        # Build Phil-only corpus (flowing paragraphs, no timestamps)
-        corpus = build_phil_corpus(segments, is_host, episode_title)
-        if corpus:
-            corpus = clean(corpus)
+        formatted = clean(build_formatted_transcript(segments, labels))
+        corpus    = build_phil_corpus(segments, labels, episode_title)
+        corpus    = clean(corpus) if corpus else None
+        report    = clean(build_attribution_report(segments, labels, episode_title, source))
 
     except Exception as e:
         log.error("Audio processing failed: %s", e)
         results["errors"].append("Audio processing: " + str(e))
         return results
     finally:
-        if audio_path and os.path.exists(audio_path):
-            os.unlink(audio_path)
-        if compressed_path and os.path.exists(compressed_path):
-            os.unlink(compressed_path)
+        for p in (audio_path, compressed_path):
+            if p and os.path.exists(p):
+                os.unlink(p)
+
+    vp_version = VOICEPRINTS.version if VOICEPRINTS else "none"
 
     # 1. Full transcript doc
     transcript_title = "[SOTA] Transcript - " + safe_title
     t_header  = "# " + episode_title + "\n\n"
     t_header += "## Full Episode Transcript\n\n"
-    t_header += "Speaker labels by resemblyzer voice matching.\n\n"
+    t_header += ("Transcript: " + source + ". Speaker labels by voiceprint matching (voiceid, voiceprints v"
+                 + vp_version + "). Unknown = voice not enrolled. Unsure = too close to call.\n\n")
     t_header += "---\n\n"
-    ok = create_google_doc(transcript_title, t_header + formatted,
-                           safe_title, master_folder=PODCAST_FOLDER)
-    if ok:
+    if create_google_doc(transcript_title, t_header + formatted, safe_title, master_folder=PODCAST_FOLDER):
         results["docs"].append(transcript_title)
     else:
         results["errors"].append("Transcript: doc creation failed")
@@ -692,16 +603,70 @@ def run_podcast_pipeline(episode_title, audio_url):
     # 2. Phil voice corpus doc
     if corpus:
         corpus_title = "[SOTA] " + HOST_NAME + " Voice Corpus - " + safe_title
-        ok = create_google_doc(corpus_title, corpus,
-                               safe_title, master_folder=PODCAST_FOLDER)
-        if ok:
+        if create_google_doc(corpus_title, corpus, safe_title, master_folder=PODCAST_FOLDER):
             results["docs"].append(corpus_title)
         else:
             results["errors"].append("Voice corpus: doc creation failed")
+    else:
+        results["errors"].append("Voice corpus: no confident " + HOST_NAME + " segments")
 
-    log.info("Podcast pipeline done - %d docs, %d errors",
-             len(results["docs"]), len(results["errors"]))
+    # 3. Attribution report
+    report_title = "[SOTA] Attribution Report - " + safe_title
+    if create_google_doc(report_title, report, safe_title, master_folder=PODCAST_FOLDER):
+        results["docs"].append(report_title)
+    else:
+        results["errors"].append("Attribution report: doc creation failed")
+
+    log.info("Podcast pipeline done - %d docs, %d errors", len(results["docs"]), len(results["errors"]))
     return results
+
+
+#  Backfill: walk the feed
+BACKFILL = {"running": False, "started": None, "finished": None, "plan": [], "done": [], "errors": [], "current": None}
+
+
+def run_backfill(items, delay_seconds):
+    BACKFILL.update(running=True, started=datetime.datetime.utcnow().isoformat(), finished=None,
+                    done=[], errors=[], current=None)
+    try:
+        for it in items:
+            BACKFILL["current"] = it["title"]
+            log.info("Backfill: %s", it["title"])
+            try:
+                res = run_podcast_pipeline(it["title"], it["audio_url"], it.get("transcript_url"))
+                BACKFILL["done"].append({"title": it["title"], "docs": len(res["docs"]), "errors": res["errors"]})
+            except Exception as e:
+                log.error("Backfill failed for '%s': %s", it["title"], e)
+                BACKFILL["errors"].append({"title": it["title"], "error": str(e)})
+            time.sleep(delay_seconds)
+    finally:
+        BACKFILL.update(running=False, current=None, finished=datetime.datetime.utcnow().isoformat())
+        log.info("Backfill finished: %d done, %d errors", len(BACKFILL["done"]), len(BACKFILL["errors"]))
+
+
+def plan_backfill(payload):
+    """
+    Choose which feed items to process.
+      feed_url      optional, defaults to FEED_URL
+      skip_titles   titles already done (matched loosely); typically the Drive folder names
+      only_titles   process only these
+      oldest_first  default true
+      max           cap on number of episodes
+    """
+    items = fetch_feed(payload.get("feed_url") or FEED_URL)
+    items = [it for it in items if it.get("audio_url")]
+    skip  = {_norm_title(t)[:40] for t in payload.get("skip_titles", [])}
+    only  = {_norm_title(t)[:40] for t in payload.get("only_titles", [])}
+    if only:
+        items = [it for it in items if _norm_title(it["title"])[:40] in only]
+    if skip:
+        items = [it for it in items if _norm_title(it["title"])[:40] not in skip]
+    if payload.get("oldest_first", True):
+        items = list(reversed(items))
+    mx = int(payload.get("max", 0) or 0)
+    if mx > 0:
+        items = items[:mx]
+    return items
 
 
 #  Transcript parsers (Discovery calls) 
@@ -957,7 +922,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self.send_json(200, {"status": "ok", "service": "SOTA Content Automation v3"})
+            self.send_json(200, {"status": "ok", "service": "SOTA Content Automation v4",
+                                 "voiceprints": VOICEPRINTS.describe() if VOICEPRINTS else None})
+        elif self.path == "/backfill/status":
+            self.send_json(200, BACKFILL)
         else:
             self.send_json(404, {"error": "not found"})
 
@@ -977,8 +945,9 @@ class Handler(BaseHTTPRequestHandler):
 
         #  Podcast episode 
         if self.path == "/episode":
-            title     = payload.get("title", "").strip()
-            audio_url = payload.get("audio_url", "").strip()
+            title          = payload.get("title", "").strip()
+            audio_url      = payload.get("audio_url", "").strip()
+            transcript_url = payload.get("transcript_url", "").strip() or None
             if not title:
                 self.send_json(400, {"error": "missing title"})
                 return
@@ -986,8 +955,38 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(400, {"error": "missing audio_url"})
                 return
             self.send_json(202, {"status": "accepted", "episode": title})
-            threading.Thread(target=run_podcast_pipeline,
-                             args=(title, audio_url), daemon=True).start()
+
+            def episode_job():
+                tr = transcript_url
+                if not tr and FEED_URL:
+                    # Zapier only sends title + audio_url; look up Spotify's transcript in the feed
+                    item = find_feed_item(title=title, audio_url=audio_url)
+                    if item and item.get("transcript_url"):
+                        tr = item["transcript_url"]
+                        log.info("Found feed transcript for '%s'", title)
+                run_podcast_pipeline(title, audio_url, tr)
+
+            threading.Thread(target=episode_job, daemon=True).start()
+
+        #  Backfill from the RSS feed
+        elif self.path == "/backfill":
+            if BACKFILL["running"]:
+                self.send_json(409, {"error": "backfill already running", "current": BACKFILL["current"]})
+                return
+            try:
+                items = plan_backfill(payload)
+            except Exception as e:
+                self.send_json(502, {"error": "feed error: " + str(e)})
+                return
+            plan = [{"title": it["title"], "pub_date": it["pub_date"],
+                     "has_transcript": bool(it.get("transcript_url"))} for it in items]
+            BACKFILL["plan"] = plan
+            if payload.get("dry_run", False):
+                self.send_json(200, {"status": "dry_run", "count": len(plan), "plan": plan})
+                return
+            delay = float(payload.get("delay_seconds", 30))
+            self.send_json(202, {"status": "accepted", "count": len(plan), "plan": plan})
+            threading.Thread(target=run_backfill, args=(items, delay), daemon=True).start()
 
         #  Discovery call 
         elif self.path == "/discovery":
@@ -1017,13 +1016,17 @@ if __name__ == "__main__":
     if not OPENAI_API_KEY:    log.warning("OPENAI_API_KEY not set")
     if not GOOGLE_SCRIPT_URL: log.warning("GOOGLE_SCRIPT_URL not set")
 
-    # Download Phil voice reference clip from Google Drive on startup
-    download_voice_reference()
+    # Load enrolled voiceprints (voiceprints.json). Without them nothing is labeled Phil.
+    try:
+        VOICEPRINTS = voiceid.Voiceprints.load(VOICEPRINTS_PATH)
+        log.info("Loaded %s", VOICEPRINTS.describe())
+    except Exception as e:
+        log.error("Could not load voiceprints from %s: %s", VOICEPRINTS_PATH, e)
 
     server = HTTPServer(("0.0.0.0", PORT), Handler)
-    log.info("SOTA Content Automation v3 running on port %d", PORT)
-    log.info("Endpoints: POST /episode | POST /discovery")
-    log.info("Health:    GET  /health")
+    log.info("SOTA Content Automation v4 running on port %d", PORT)
+    log.info("Endpoints: POST /episode | POST /backfill | POST /discovery")
+    log.info("Health:    GET  /health | GET /backfill/status")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
