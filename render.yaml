@@ -6,11 +6,17 @@ services:
     startCommand: python server.py
     envVars:
       - key: ANTHROPIC_API_KEY
-        sync: false          # you'll paste this in Render's dashboard
+        sync: false          # paste in Render's dashboard
+      - key: OPENAI_API_KEY
+        sync: false          # Whisper fallback when the feed has no transcript
       - key: GOOGLE_SCRIPT_URL
         sync: false
       - key: WEBHOOK_SECRET
         sync: false
+      - key: HOST_NAME
+        value: Phil
+      - key: FEED_URL
+        value: https://anchor.fm/s/ff847b50/podcast/rss
       - key: PORT
         value: 8080
     healthCheckPath: /health
